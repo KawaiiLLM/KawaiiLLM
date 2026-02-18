@@ -1,12 +1,15 @@
 import argparse
 import json
 import logging
-import os
-import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from transformers import AutoTokenizer
 from tqdm import tqdm
+
+from utils.chunking import chunk_by_tokens
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,125 +82,6 @@ def concatenate_text(data: dict) -> str:
     return "\n\n".join(pieces)
 
 
-def split_by_sentence(text: str) -> list:
-    """按结束标点切分，标点保留在前一段末尾。
-
-    支持中文标点（。！？…；）和英文标点（! ? ;）以及换行符。
-    """
-    parts = re.split(r'(?<=[。！？…；!?\n])', text)
-    return [p for p in parts if p]
-
-
-def hard_split_by_chars(text: str, tokenizer, max_tokens: int) -> list:
-    """字符级兜底硬切：用二分查找找到不超过 max_tokens 的最长前缀。
-
-    保证不破坏字符完整性。
-    """
-    blocks = []
-    remaining = text
-    while remaining:
-        tok_len = len(tokenizer.encode(remaining, add_special_tokens=False))
-        if tok_len <= max_tokens:
-            blocks.append(remaining)
-            break
-
-        # 二分查找：找到最大的 mid 使得 remaining[:mid] 的 token 数 <= max_tokens
-        lo, hi = 1, len(remaining)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if len(tokenizer.encode(remaining[:mid], add_special_tokens=False)) <= max_tokens:
-                lo = mid
-            else:
-                hi = mid - 1
-        blocks.append(remaining[:lo])
-        remaining = remaining[lo:]
-
-    return blocks
-
-
-def chunk_by_tokens(text: str, tokenizer, max_tokens: int) -> list:
-    """将完整小说文本按 token 数切分为多个 chunk。
-
-    切分策略（逐级细分）:
-        1. 先按 \\n\\n 切分为段落。
-        2. 若段落超过 max_tokens，再按 \\n 切分。
-        3. 若仍超过，再按结束标点切分。
-        4. 若仍超过，按字符级二分查找硬切。
-        5. 将上述小块逐个累积，一旦累积超过 max_tokens，
-           就把之前累积的内容作为一个 chunk 输出，
-           当前块成为下一个 chunk 的起始。
-    """
-    if not text:
-        return []
-
-    def count_tokens(s: str) -> int:
-        return len(tokenizer.encode(s, add_special_tokens=False))
-
-    # ========== 第一步：按 \n\n 切分 ==========
-    raw_paragraphs = text.split('\n\n')
-
-    # 重新附加分隔符，保持原文还原性
-    paragraphs_with_sep = []
-    for i, para in enumerate(raw_paragraphs):
-        suffix = "\n\n" if i < len(raw_paragraphs) - 1 else ""
-        paragraphs_with_sep.append(para + suffix)
-
-    # ========== 第二步：超长段落逐级细分 ==========
-    refined_blocks: list = []
-
-    for para_text in paragraphs_with_sep:
-        if count_tokens(para_text) <= max_tokens:
-            refined_blocks.append(para_text)
-            continue
-
-        # --- 2a: 按 \n 切分 ---
-        lines = para_text.split('\n')
-        line_pieces = []
-        for j, line in enumerate(lines):
-            line_suffix = "\n" if j < len(lines) - 1 else ""
-            line_pieces.append(line + line_suffix)
-
-        for line_text in line_pieces:
-            if count_tokens(line_text) <= max_tokens:
-                refined_blocks.append(line_text)
-                continue
-
-            # --- 2b: 按结束标点切分 ---
-            sentences = split_by_sentence(line_text)
-            for sent in sentences:
-                if count_tokens(sent) <= max_tokens:
-                    refined_blocks.append(sent)
-                else:
-                    # --- 2c: 字符级兜底硬切 ---
-                    hard_blocks = hard_split_by_chars(sent, tokenizer, max_tokens)
-                    refined_blocks.extend(hard_blocks)
-
-    # ========== 第三步：累积合并为 chunk ==========
-    chunks: list = []
-    current_text = ""
-    current_len = 0
-
-    for block in refined_blocks:
-        block_len = count_tokens(block)
-
-        if current_len + block_len > max_tokens:
-            # flush 前面累积的内容
-            if current_text:
-                chunks.append(current_text)
-            # 新 block 作为新 chunk 的起点
-            current_text = block
-            current_len = block_len
-        else:
-            current_text += block
-            current_len += block_len
-
-    # flush 残余
-    if current_text:
-        chunks.append(current_text)
-
-    return chunks
-
-
 def main():
     args = parse_args()
 
@@ -223,12 +107,21 @@ def main():
             if not full_text.strip():
                 continue
 
-            chunks = chunk_by_tokens(full_text, tokenizer, args.max_tokens)
-            if not chunks:
+            # Check total character count before chunking
+            if len(full_text) < 4000:
                 continue
 
             meta = data.get("meta", {})
             novel_id = meta.get("id") or path.stem
+            title = meta.get("title", "")
+
+            # C2 修复：标题在 chunking 之前拼入，确保不超 max_tokens
+            if title:
+                full_text = f"{title}\n\n{full_text}"
+
+            chunks = chunk_by_tokens(full_text, tokenizer, args.max_tokens)
+            if not chunks:
+                continue
 
             for idx, chunk in enumerate(chunks):
                 record = {
