@@ -89,11 +89,18 @@ class KawaiiLLMModel(nn.Module):
             nn.GELU(),
             nn.Linear(meme_hidden * 4, llm_hidden),
         )
-        # Initialize projector Linear layers with small weights
-        for module in self.projector:
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, std=0.02)
-                nn.init.zeros_(module.bias)
+        # Initialize projector Linear layers.
+        # The LAST layer uses near-zero init so the projected prefix starts at
+        # a similar scale to the LLM's own embeddings (~0.02 std).  Without
+        # this, the projector output (std ≈ 1.4) is ~70× larger, causing
+        # extreme attention scores, high loss, and NaN gradients.
+        proj_linears = [m for m in self.projector if isinstance(m, nn.Linear)]
+        for module in proj_linears[:-1]:
+            nn.init.normal_(module.weight, std=0.02)
+            nn.init.zeros_(module.bias)
+        # Last layer: near-zero output so LLM sees almost no prefix initially
+        nn.init.normal_(proj_linears[-1].weight, std=1e-4)
+        nn.init.zeros_(proj_linears[-1].bias)
 
         # Apply freezing
         if freeze_meme:
@@ -348,17 +355,23 @@ class KawaiiLLMModel(nn.Module):
                 )
                 dummy_proj = self.projector(dummy_mem)  # [1, 1, llm_hidden]
 
-                # 1-token masked prefix, connected to dummy_proj for grad flow
+                # 1-token prefix with mask=1, connected to dummy_proj for
+                # grad flow.  mask=1 lets it self-attend (avoids NaN from
+                # softmax over all-masked keys).  We also mask labels[0] so
+                # no loss is computed at the prefix-to-target boundary where
+                # logits are based on the dummy input.
                 prefix_embeds = target_embeds.new_zeros(B, 1, llm_hidden)
                 prefix_embeds = prefix_embeds + (dummy_proj.sum() * 0.0)
-                prefix_mask = attention_mask.new_zeros(B, 1)
+                prefix_mask = attention_mask.new_ones(B, 1)
 
                 combined_embeds = torch.cat([prefix_embeds, target_embeds], dim=1)
                 combined_mask = torch.cat([prefix_mask, attention_mask], dim=1)
                 prefix_labels = torch.full(
                     (B, 1), IGNORE_INDEX, dtype=labels.dtype, device=device,
                 )
-                combined_labels = torch.cat([prefix_labels, labels], dim=1)
+                safe_labels = labels.clone()
+                safe_labels[:, 0] = IGNORE_INDEX
+                combined_labels = torch.cat([prefix_labels, safe_labels], dim=1)
                 position_ids = combined_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(combined_mask == 0, 0)
 
@@ -444,15 +457,29 @@ class KawaiiLLMModel(nn.Module):
         prefix_embeds = torch.stack(prefix_embeds_list)  # [B, max_prefix_len, llm_hidden]
         prefix_attn = torch.stack(prefix_mask_list)      # [B, max_prefix_len]
 
+        # Ensure position 0 of the prefix always has mask=1.  Without this,
+        # left-padded positions (mask=0) have NO valid attention keys (causal
+        # constraint), causing NaN in softmax → NaN hidden states → NaN grads
+        # for shared parameters even when labels are IGNORE_INDEX.
+        prefix_attn[:, 0] = 1
+
         # 3. Concatenate: [prefix, target_text]
         llm_input = torch.cat([prefix_embeds, target_embeds], dim=1)
 
-        # 4. Build labels: IGNORE for all prefix positions, real labels for target
+        # 4. Build labels: IGNORE for all prefix positions, real labels for target.
+        # For NTP samples (n_mem=0), also mask the first target token's label:
+        # after HF's internal label shift, the last prefix position's logits
+        # are evaluated against labels[:,0].  For NTP samples the prefix
+        # logits are from zero/dummy input — masking avoids polluting the loss.
+        safe_labels = labels.clone()
+        ntp_mask = (n_mem == 0)
+        if ntp_mask.any():
+            safe_labels[ntp_mask, 0] = IGNORE_INDEX
         ignore_prefix = torch.full(
             (B, max_prefix_len), IGNORE_INDEX,
             dtype=labels.dtype, device=device,
         )
-        llm_labels = torch.cat([ignore_prefix, labels], dim=1)
+        llm_labels = torch.cat([ignore_prefix, safe_labels], dim=1)
 
         # 5. Build attention mask for full sequence
         llm_attn_mask = torch.cat([prefix_attn, attention_mask], dim=1)
