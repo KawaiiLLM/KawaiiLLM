@@ -153,25 +153,26 @@ projected = projector(mem_hidden)  # [B, n, llm_hidden]
 ```
 
 3. **Decode with LLM**
-```python
-# 构建 LLM 输入
-# 重建: [<mem>, h_1, ..., h_N, </mem>, <AE>, target_tokens...]
-# 续写: [<mem>, h_1, ..., h_N, </mem>, target_tokens...]
-mem_start_llm = llm.get_input_embeddings()(mem_token_id)        # [1, llm_hidden]
-mem_end_llm   = llm.get_input_embeddings()(mem_end_token_id)    # [1, llm_hidden]
-ae_emb        = llm.get_input_embeddings()(ae_token_id)         # [1, llm_hidden] (仅重建)
-target_embeds = llm.get_input_embeddings()(input_ids)           # [B, T, llm_hidden]
 
-# 拼接构成完整 LLM 输入
-prefix = cat([mem_start_llm, projected, mem_end_llm, ae_emb?], dim=1)
+`<AE>` 信号由 dataset 层放入 `input_ids`（重建任务在 target_ids 前加 `<AE>`），model.forward() 使用固定 prefix，无需 task_type 分支：
+
+```python
+# LLM prefix: 固定结构 [<mem>, h_1, ..., h_N, </mem>]
+prefix = cat([mem_start_emb, projected, mem_end_emb], dim=1)
+
+# input_ids 由 dataset 构造：
+#   重建: [<AE>, t1, t2, ..., tn]  (labels: [IGNORE, t1, t2, ..., tn])
+#   续写: [t1, t2, ..., tn]        (labels: [t1, t2, ..., tn])
+target_embeds = llm.get_input_embeddings()(input_ids)
 llm_input = cat([prefix, target_embeds], dim=1)
 
-# Labels: IGNORE 对应 prefix 的所有位置
 labels = cat([IGNORE × prefix_len, target_labels], dim=1)
 return llm(inputs_embeds=llm_input, attention_mask=..., labels=labels)
 ```
 
-> **Labels 对齐说明**: HF 的 `ForCausalLM.forward()` 内部会自动做 `shift_labels = labels[..., 1:]`。因此 `cat([IGNORE*prefix_len, target_labels])` 的效果是：prefix 最后一个 token 学习预测第一个 target token（正确的因果桥接），无需手动移位。
+> **Labels 对齐说明**: HF 的 `ForCausalLM.forward()` 内部会自动做 `shift_labels = labels[..., 1:]`。因此 `cat([IGNORE*prefix_len, target_labels])` 的效果是：prefix 最后一个 token（`</mem>`）学习预测第一个 target token（重建时为 `<AE>`，续写时为 `t1`），无需手动移位。
+>
+> **`<AE>` per-sample 设计**: 将 `<AE>` 放入 `input_ids` 而非在 model.forward() 中按 batch 注入。这样同一 batch 中可以混合重建和续写样本，无需 grouped batch sampler。
 
 **Additional Methods:**
 
@@ -192,20 +193,29 @@ return llm(inputs_embeds=llm_input, attention_mask=..., labels=labels)
 1. **Reconstruction (AE):** `context` = text → MemE → latent → LLM（带 `<AE>` 信号）→ `same text`
 2. **Continuation (AR):** `split_x` → MemE → latent → LLM → `split_{x+1}`
 
-### Task Assignment — 确定性分配
+### Task Assignment — 线性 warmup + 合成续写
 
-不使用概率采样，而是确定性地分配任务类型：
+续写概率在训练前 10% 线性增长到 50%，之后保持 50%。如果选择续写但无自然续写对，则在 `\n` 处切分当前文本合成续写对：
 
 ```python
 def _get_task_type(idx, progress):
-    if not has_continuation[idx]:
-        return "reconstruction"  # 无续写对 → 永远重建
     if progress < 0.1:
-        return "reconstruction"  # warmup 阶段 → 先建立基本映射
-    return "continuation"        # warmup 后 → 有续写对就做续写
+        cont_prob = 0.5 * (progress / 0.1)  # 0% -> 50%
+    else:
+        cont_prob = 0.5
+
+    if random.random() < cont_prob:
+        return "continuation"
+    return "reconstruction"
 ```
 
-效果：warmup 后实际续写比例 = 有续写对的 entry 占比 ≈ **12.2%**，其余 87.8% 做重建。每个 entry 每 epoch 只访问一次，无过采样，多 epoch 行为一致。
+续写来源（在 `__getitem__` 中处理）：
+1. **自然续写**: 有 continuation pair → 使用下一 chunk
+2. **合成续写**: 无 continuation pair → 在 `\n` 处切分当前文本（优先选最接近中点的 `\n`）
+
+效果：50% 续写比例中，有自然续写对的样本使用真实对，无续写对的样本使用合成切分。所有样本都能参与续写任务。
+
+**`<AE>` per-sample 实现**: 重建任务在 `input_ids` 前端插入 `<AE>` token（label 为 IGNORE），续写任务不加。这样每个样本独立携带任务信号，无需 per-batch task_type。
 
 ### Data Access
 
@@ -214,8 +224,8 @@ def _get_task_type(idx, progress):
 * **File Handle Cache:** Per-file，带 `__del__` 清理。
 * **Worker Safety:** 提供 `worker_init_fn` 静态方法，DataLoader 每个 worker 独立重置文件句柄并 seed RNG。
 * `set_training_progress(float)`: Called by trainer callback.
-* **`__getitem__` returns:** `{"context_ids": Tensor, "input_ids": Tensor, "labels": Tensor, "task_type": str}`.
-* *Note: `n_mem` is NOT sampled per-sample — it is sampled per-batch in the collator.*
+* **`__getitem__` returns:** `{"context_ids": Tensor, "input_ids": Tensor, "labels": Tensor}`.
+* *Note: `n_mem` is NOT sampled per-sample — it is sampled per-batch in the collator. `task_type` 不在返回 dict 中——通过 `<AE>` token 在 input_ids 中隐式编码。*
 
 ---
 
@@ -417,7 +427,7 @@ deepspeed --num_gpus 8 src/train/train.py \
 | **Special tokens** | 无 | `<mem>`, `</mem>`, `<mempad>`, `<AE>` 动态注册 + embedding resize | README 设计要求区分任务模式和标记 memory 边界 |
 | **Projector 架构** | `Linear→GELU→Linear` | `RMSNorm(meme_dim) → Linear(meme_dim, meme_dim*4) → GELU → Linear(meme_dim*4, llm_dim)` | 参考 PCC/Qwen2.5-VL 共识设计，RMSNorm 稳定输入 |
 | **n_mem 课程** | 3-phase 阶梯 (先少后多) | 线性插值 (先多后少): P(64-128)=0.7-0.6p, P(1)=0.3p | README "先多后少" 设计 + 避免阶梯跳变 |
-| **续写任务分配** | 概率采样 (30%/50%) | 确定性: warmup 10% 后有续写对就做续写 | 每 entry 每 epoch 只访问一次，无过采样，应最大化利用续写对 |
+| **续写任务分配** | 概率采样 (30%/50%) | 线性 warmup (0→50% over 10%) + 合成续写（无自然对时按 `\n` 切分） | 所有样本均可续写；`<AE>` 放入 input_ids 实现 per-sample 任务信号 |
 | **Phase 1 freeze_meme** | `--freeze_meme True` | `--freeze_meme False` | README 阶段 1 = 全参数训练，MemE 用极低 LR |
 | Per-component LR | 未包含 | `meme_lr`, `llm_lr`, `projector_lr` in `ModelArguments`; `create_optimizer()` 分组实现 | 随机初始化组件和预训练组件需差异化 LR |
 | Frozen MemE 处理 | `gradient_checkpointing_enable()` 对所有组件 | Frozen MemE 在 `torch.no_grad()` 下运行，跳过 gradient checkpointing；输出 `detach().requires_grad_(True)` | 冻结模型无需 checkpointing |

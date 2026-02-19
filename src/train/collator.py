@@ -6,23 +6,18 @@ Handles two different padding strategies:
     - input_ids / labels: RIGHT-padded (standard causal LM convention).
 
 Also samples a single n_mem value per batch from a linear "many-to-few"
-curriculum distribution, and passes through task_type.
+curriculum distribution.
 
-Note: task_type is per-batch (required by model architecture since <AE> token
-affects prefix length). With random shuffling, batches may contain mixed task
-types; the majority type is used. A grouped batch sampler would eliminate this.
+Task type (reconstruction vs continuation) is handled per-sample in the
+dataset via <AE> token in input_ids — no per-batch task_type needed.
 """
 
-import logging
 import random
-from collections import Counter
 from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizer
-
-logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
@@ -80,13 +75,6 @@ class KawaiiDataCollator:
         input_ids_list = [inst["input_ids"] for inst in instances]
         labels_list = [inst["labels"] for inst in instances]
 
-        # Determine batch task_type via majority vote
-        # Mixed task types occur because the DataLoader shuffles samples randomly.
-        # Since <AE> prefix affects sequence layout, the batch must use a single type.
-        task_types = [inst.get("task_type", "reconstruction") for inst in instances]
-        counts = Counter(task_types)
-        task_type = counts.most_common(1)[0][0]
-
         # --- Left-pad context_ids (for MemE, padding_side='left') ---
         max_ctx_len = max(ids.shape[0] for ids in context_ids_list)
         padded_ctx = []
@@ -107,6 +95,8 @@ class KawaiiDataCollator:
             context_attention_mask[i, max_ctx_len - real_len:] = 1
 
         # --- Right-pad input_ids and labels (standard causal LM) ---
+        # Note: reconstruction samples have <AE> prepended (longer by 1 token),
+        # continuation samples do not. Padding handles the length difference.
         max_tgt_len = max(ids.shape[0] for ids in input_ids_list)
         padded_ids = []
         padded_labels = []
@@ -138,5 +128,4 @@ class KawaiiDataCollator:
             "attention_mask": attention_mask,
             "labels": labels,
             "n_mem": n_mem,
-            "task_type": task_type,
         }

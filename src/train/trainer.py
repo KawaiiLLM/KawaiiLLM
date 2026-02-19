@@ -66,12 +66,10 @@ class KawaiiTrainer(Trainer):
         return dataloader
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Extract n_mem and task_type from inputs and call model.forward()."""
+        """Extract n_mem from inputs and call model.forward()."""
         n_mem = inputs.pop("n_mem")
         if isinstance(n_mem, torch.Tensor):
             n_mem = n_mem.item()
-
-        task_type = inputs.pop("task_type", "reconstruction")
 
         outputs = model(
             context_ids=inputs["context_ids"],
@@ -80,7 +78,6 @@ class KawaiiTrainer(Trainer):
             attention_mask=inputs["attention_mask"],
             labels=inputs["labels"],
             n_mem=n_mem,
-            task_type=task_type,
         )
 
         loss = outputs.loss

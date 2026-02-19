@@ -1,17 +1,22 @@
 """KawaiiDataset: byte-offset indexed dataset with curriculum sampling.
 
 Two training tasks:
-    1. Reconstruction: context -> MemE -> latent -> LLM -> same text
-    2. Continuation: split_x -> MemE -> latent -> LLM -> split_{x+1}
+    1. Reconstruction (AE): context -> MemE -> latent -> LLM (<AE> signal) -> same text
+    2. Continuation (AR): split_x -> MemE -> latent -> LLM -> split_{x+1}
 
-Curriculum learning controls n_mem distribution and task mix based on
-training progress (set externally by CurriculumCallback).
+Task assignment:
+    - Continuation probability linearly increases from 0% to 50% over the first
+      10% of training, then stays at 50%.
+    - If continuation is chosen, use the natural next chunk if available;
+      otherwise, split the current text at a newline boundary.
+    - <AE> token is prepended to input_ids for reconstruction tasks, so each
+      sample independently carries its own task signal (no per-batch constraint).
 """
 
 import json
 import logging
 import random
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -42,6 +47,9 @@ class KawaiiDataset(Dataset):
         self.context_max_length = context_max_length
         self.target_max_length = target_max_length
 
+        # <AE> token ID for reconstruction task signal
+        self._ae_token_id = tokenizer.convert_tokens_to_ids("<AE>")
+
         # Build set of entries that have continuation targets
         self._continuation_source_set = set()
         self._continuation_map: Dict[int, int] = {}
@@ -56,9 +64,10 @@ class KawaiiDataset(Dataset):
         self._file_handles: Dict[str, object] = {}
 
         logger.info(
-            "Dataset: %d entries, %d continuation pairs",
+            "Dataset: %d entries, %d continuation pairs, <AE> id=%d",
             len(self.entries),
             len(self.continuation_pairs),
+            self._ae_token_id,
         )
 
     def __del__(self):
@@ -101,17 +110,57 @@ class KawaiiDataset(Dataset):
         return json.loads(line.decode("utf-8"))
 
     def _get_task_type(self, idx: int) -> str:
-        """Determine task type: deterministic assignment.
+        """Determine task type with linearly increasing continuation probability.
 
-        - Entries without continuation pairs always do reconstruction.
-        - During warmup (progress < 10%), all entries do reconstruction.
-        - After warmup, entries with continuation pairs always do continuation.
+        Continuation probability:
+            - progress < 0.1: linearly ramps from 0% to 50%
+            - progress >= 0.1: stays at 50%
+
+        If continuation is chosen but no natural next chunk exists,
+        the text will be split synthetically (handled in __getitem__).
         """
-        if idx not in self._continuation_source_set:
-            return "reconstruction"
-        if self._training_progress < 0.1:
-            return "reconstruction"
-        return "continuation"
+        p = self._training_progress
+        if p < 0.1:
+            cont_prob = 0.5 * (p / 0.1)  # 0% -> 50%
+        else:
+            cont_prob = 0.5
+
+        if random.random() < cont_prob:
+            return "continuation"
+        return "reconstruction"
+
+    # Minimum characters per half when splitting for synthetic continuation.
+    # Texts shorter than 2x this or without a valid \n split point fall back
+    # to reconstruction.
+    _MIN_SPLIT_CHARS = 64
+
+    @staticmethod
+    def _split_text(text: str, min_chars: int = 64) -> Optional[Tuple[str, str]]:
+        """Try to split text at a newline for synthetic continuation.
+
+        Returns (context, target) if a good split is found, None otherwise.
+        A "good split" requires:
+            1. The text contains at least one ``\\n``.
+            2. Both halves are at least *min_chars* characters long.
+
+        Among valid newlines, picks the one closest to the midpoint.
+        """
+        if len(text) < min_chars * 2:
+            return None
+
+        mid = len(text) // 2
+
+        # Find newline positions that leave both halves >= min_chars
+        candidates = [
+            i for i, c in enumerate(text)
+            if c == "\n" and i >= min_chars and len(text) - i - 1 >= min_chars
+        ]
+
+        if not candidates:
+            return None
+
+        best = min(candidates, key=lambda pos: abs(pos - mid))
+        return text[:best + 1], text[best + 1:]
 
     def __len__(self):
         return len(self.entries)
@@ -119,29 +168,42 @@ class KawaiiDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         """Return a single training sample.
 
+        For reconstruction: input_ids starts with <AE> token as task signal.
+        For continuation: input_ids has no prefix (target text only).
+
         Returns:
             dict with:
                 context_ids: [L_ctx] — tokenized context for MemE
-                input_ids: [T] — tokenized target for LLM
-                labels: [T] — labels (same as input_ids, padding will be IGNORE)
-                task_type: "reconstruction" or "continuation"
+                input_ids: [T] — tokenized target for LLM (may start with <AE>)
+                labels: [T] — labels (IGNORE for <AE> position, real for rest)
         """
         task_type = self._get_task_type(idx)
         record = self._read_entry(idx)
         text = record.get("text", "")
 
-        if task_type == "continuation" and idx in self._continuation_map:
-            # Context = current split, target = next split
-            target_idx = self._continuation_map[idx]
-            target_record = self._read_entry(target_idx)
-            context_text = text
-            target_text = target_record.get("text", "")
-        else:
-            # Reconstruction: context and target are the same text
+        if task_type == "continuation":
+            if idx in self._continuation_map:
+                # Natural continuation: context = this chunk, target = next chunk
+                target_idx = self._continuation_map[idx]
+                target_record = self._read_entry(target_idx)
+                context_text = text
+                target_text = target_record.get("text", "")
+            else:
+                # Synthetic continuation: try to split at a newline boundary
+                split = self._split_text(text, self._MIN_SPLIT_CHARS)
+                if split is not None:
+                    context_text, target_text = split
+                else:
+                    # Text too short or no valid \n — fall back to reconstruction
+                    task_type = "reconstruction"
+                    context_text = text
+                    target_text = text
+
+        if task_type == "reconstruction":
             context_text = text
             target_text = text
 
-        # Tokenize context (for MemE) — no special tokens needed
+        # Tokenize context (for MemE)
         context_ids = self.tokenizer.encode(
             context_text,
             add_special_tokens=False,
@@ -150,21 +212,34 @@ class KawaiiDataset(Dataset):
         )
 
         # Tokenize target (for LLM)
+        # Reserve 1 token for EOS (and 1 more for <AE> in reconstruction)
+        ae_overhead = 1 if task_type == "reconstruction" else 0
         target_ids = self.tokenizer.encode(
             target_text,
             add_special_tokens=False,
-            max_length=self.target_max_length,
+            max_length=self.target_max_length - 1 - ae_overhead,
             truncation=True,
         )
+        # Append EOS so the model learns when to stop generating
+        target_ids = target_ids + [self.tokenizer.eos_token_id]
 
-        # For causal LM, labels = input_ids (shift is done internally by the model)
+        if task_type == "reconstruction":
+            # Prepend <AE> token as reconstruction signal
+            # Label for <AE> is IGNORE (it's a provided signal, not a prediction target)
+            input_ids = torch.tensor(
+                [self._ae_token_id] + target_ids, dtype=torch.long
+            )
+            labels = torch.tensor(
+                [IGNORE_INDEX] + target_ids, dtype=torch.long
+            )
+        else:
+            input_ids = torch.tensor(target_ids, dtype=torch.long)
+            labels = input_ids.clone()
+
         context_ids = torch.tensor(context_ids, dtype=torch.long)
-        input_ids = torch.tensor(target_ids, dtype=torch.long)
-        labels = input_ids.clone()
 
         return {
             "context_ids": context_ids,
             "input_ids": input_ids,
             "labels": labels,
-            "task_type": task_type,
         }

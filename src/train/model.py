@@ -271,23 +271,24 @@ class KawaiiLLMModel(nn.Module):
         attention_mask: torch.LongTensor,
         labels: torch.LongTensor,
         n_mem: int,
-        task_type: str = "reconstruction",
         **kwargs,
     ):
         """Full forward pass: encode context -> project -> decode with LLM.
 
-        LLM input layout:
-            Reconstruction: [<mem>] [h_1, ..., h_N] [</mem>] [<AE>] [target_tokens...]
-            Continuation:   [<mem>] [h_1, ..., h_N] [</mem>] [target_tokens...]
+        LLM input layout (task-agnostic prefix + per-sample target):
+            [<mem>] [h_1, ..., h_N] [</mem>] [input_ids...]
+
+        The <AE> task signal is embedded in input_ids by the dataset:
+            Reconstruction: input_ids = [<AE>, target_tokens...]
+            Continuation:   input_ids = [target_tokens...]
 
         Args:
             context_ids: [B, L_ctx] — context tokens (left-padded).
             context_attention_mask: [B, L_ctx] — context attention mask.
-            input_ids: [B, T] — target tokens (right-padded).
+            input_ids: [B, T] — target tokens (right-padded, may start with <AE>).
             attention_mask: [B, T] — target attention mask.
-            labels: [B, T] — target labels with IGNORE_INDEX for padding.
+            labels: [B, T] — target labels with IGNORE_INDEX for padding/<AE>.
             n_mem: int — number of MEM tokens for this batch.
-            task_type: "reconstruction" or "continuation".
 
         Returns:
             CausalLMOutputWithPast with loss.
@@ -304,7 +305,7 @@ class KawaiiLLMModel(nn.Module):
         # 2. Project to LLM dimension
         projected = self.projector(mem_hidden)  # [B, n_mem, llm_hidden]
 
-        # 3. Build LLM prefix: [<mem>, h_1..h_N, </mem>, (<AE>)?]
+        # 3. Build LLM prefix: [<mem>, h_1..h_N, </mem>]
         mem_start_id = torch.tensor(
             [self._mem_token_id], device=device, dtype=torch.long
         )
@@ -314,18 +315,10 @@ class KawaiiLLMModel(nn.Module):
         mem_start_emb = llm_embed(mem_start_id).unsqueeze(0).expand(B, -1, -1)  # [B, 1, llm_hidden]
         mem_end_emb = llm_embed(mem_end_id).unsqueeze(0).expand(B, -1, -1)  # [B, 1, llm_hidden]
 
-        prefix_parts = [mem_start_emb, projected, mem_end_emb]
+        prefix_embeds = torch.cat(
+            [mem_start_emb, projected, mem_end_emb], dim=1
+        )  # [B, prefix_len, llm_hidden]
         prefix_len = 1 + n_mem + 1  # <mem> + projected + </mem>
-
-        if task_type == "reconstruction":
-            ae_id = torch.tensor(
-                [self._ae_token_id], device=device, dtype=torch.long
-            )
-            ae_emb = llm_embed(ae_id).unsqueeze(0).expand(B, -1, -1)  # [B, 1, llm_hidden]
-            prefix_parts.append(ae_emb)
-            prefix_len += 1
-
-        prefix_embeds = torch.cat(prefix_parts, dim=1)  # [B, prefix_len, llm_hidden]
 
         # 4. Get target embeddings from LLM's embedding layer
         target_embeds = llm_embed(input_ids)  # [B, T, llm_hidden]

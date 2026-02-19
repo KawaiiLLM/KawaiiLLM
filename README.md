@@ -493,20 +493,29 @@ P(single:    1)  = 0.3p           //  0% → 30%
 | 50% | 40% | 25% | 20% | 15% |
 | 100% | 10% | 30% | 30% | 30% |
 
-**续写任务：确定性分配**
+**续写任务：线性 warmup + 合成续写**
 
-数据统计表明仅 12.2% 的 entries 有续写对。每个 entry 每 epoch 只访问一次，不存在过采样。对有续写对的 entry 应最大化利用：
+续写概率在训练前 10% 线性增长到 50%，之后保持 50%。先随机决定重建还是续写，再根据数据情况获取续写目标：
 
 ```python
 def get_task_type(idx, progress):
-    if not has_continuation[idx]:
-        return "reconstruction"  # 无续写对 → 永远重建
-    if progress < 0.1:
-        return "reconstruction"  # warmup 阶段 → 先建立基本映射
-    return "continuation"        # warmup 后 → 有续写对就做续写
+    # 线性 warmup: 续写概率 0% → 50% (over first 10%)
+    cont_prob = min(0.5, 0.5 * progress / 0.1)
+    if random.random() < cont_prob:
+        return "continuation"
+    return "reconstruction"
+
+# 在 __getitem__ 中：
+if task_type == "continuation":
+    if has_next_chunk[idx]:
+        context, target = current_chunk, next_chunk  # 自然续写
+    else:
+        context, target = split_at_newline(text)      # 合成续写（按 \n 切分）
 ```
 
-效果：warmup 后实际续写比例 = 有续写对的 entry 占比 = **12.2%**，其余 87.8% 做重建。无随机性，多 epoch 行为一致。
+效果：所有样本均可参与续写训练（不受限于 12.2% 的自然续写对）。有自然续写对的样本使用真实下一 chunk，无续写对的样本在 `\n` 处切分当前文本。
+
+**`<AE>` per-sample 任务信号**：重建任务在 LLM 的 `input_ids` 前端插入 `<AE>` token，续写任务不加。这样每个样本独立携带任务信号，同一 batch 内可混合两种任务，无需 grouped batch sampler。
 
 **二维课程空间**
 
