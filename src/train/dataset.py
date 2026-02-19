@@ -5,24 +5,45 @@ Three training tasks:
     2. Reconstruction (AE): context -> MemE -> latent -> LLM (<AE> signal) -> same text.
     3. Continuation (AR): split_x -> MemE -> latent -> LLM -> split_{x+1}.
 
-Task assignment:
-    - Deterministic rotation: each sample is assigned exactly one task per epoch.
-      Over every consecutive 3 epochs, each sample trains with each task exactly
-      once. Formula: task_idx = (sample_idx + epoch + epoch // 3) % 3.
-    - Equal 1/3 ratio from the start, no warmup needed.
-    - If continuation is assigned but cannot be executed (text too short to split,
-      no natural next chunk), falls back to NTP.
-    - <AE> token is prepended to input_ids for reconstruction tasks.
+Task assignment (2/3-task rotation):
+    - Entries WITH a next chunk (continuation pair exists): 3-task rotation
+      over NTP, reconstruction, continuation.
+      Formula: task_idx = (idx + epoch + epoch // 3) % 3
+    - Entries WITHOUT a next chunk: 2-task rotation over NTP, reconstruction.
+      Formula: task_idx = (idx + epoch) % 2
+    - This ensures continuation is only assigned to samples that can execute it,
+      eliminating all fallback logic.
 
 Per-sample n_mem:
     - NTP: n_mem = 0 (no MemE involvement).
     - Reconstruction / Continuation: uniform [1, num_mem_tokens].
+
+EOS policy:
+    EOS is added only when the text genuinely ends. Merged entries (artificial
+    \\n\\n joins) never get EOS. Reconstruction always gets EOS on non-merged
+    entries (complete text boundary). NTP and continuation respect has_next.
+
+    NTP:
+        merged entry             -> no EOS  (artificial boundary)
+        non-merged, has next     -> no EOS  (text continues)
+        non-merged, no next      -> EOS     (document ends)
+    Reconstruction:
+        merged entry             -> no EOS  (artificial boundary)
+        non-merged               -> EOS     (complete reconstruction)
+    Continuation (only non-merged with next chunk):
+        target has next chunk    -> no EOS  (text continues)
+        target is last chunk     -> EOS     (document ends)
+
+Merged chunks:
+    - Short orphan entries merged by build_index.py have a "parts" field
+      instead of "file"/"offset". These are read by loading each part and
+      joining with "\\n\\n".
 """
 
 import json
 import logging
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 import torch
 from torch.utils.data import Dataset
@@ -32,7 +53,8 @@ logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
-TASK_TYPES = ["ntp", "reconstruction", "continuation"]
+TASK_TYPES_3 = ["ntp", "reconstruction", "continuation"]
+TASK_TYPES_2 = ["ntp", "reconstruction"]
 
 
 class KawaiiDataset(Dataset):
@@ -65,16 +87,22 @@ class KawaiiDataset(Dataset):
         for src_idx, tgt_idx in self.continuation_pairs:
             self._continuation_map[src_idx] = tgt_idx
 
+        # Set of entries that have a next chunk (eligible for 3-task rotation)
+        self._has_next: set = set(self._continuation_map.keys())
+
         # Current epoch for deterministic task rotation (updated by callback)
         self._current_epoch = 0
 
         # File handle cache (per-worker, safe with DataLoader fork)
         self._file_handles: Dict[str, object] = {}
 
+        n_3task = len(self._has_next)
+        n_2task = len(self.entries) - n_3task
+        n_merged = sum(1 for e in self.entries if "parts" in e)
         logger.info(
-            "Dataset: %d entries, %d continuation pairs, <AE> id=%d, "
-            "num_mem_tokens=%d",
-            len(self.entries),
+            "Dataset: %d entries (%d 3-task, %d 2-task, %d merged), "
+            "%d continuation pairs, <AE> id=%d, num_mem_tokens=%d",
+            len(self.entries), n_3task, n_2task, n_merged,
             len(self.continuation_pairs),
             self._ae_token_id,
             num_mem_tokens,
@@ -111,25 +139,48 @@ class KawaiiDataset(Dataset):
             self._file_handles[filepath] = open(filepath, "rb")
         return self._file_handles[filepath]
 
-    def _read_entry(self, idx: int) -> dict:
-        """Read a single entry by byte offset."""
-        entry = self.entries[idx]
-        fh = self._get_file_handle(entry["file"])
-        fh.seek(entry["offset"])
+    def _read_record(self, file: str, offset: int) -> dict:
+        """Read a single JSONL record by file path and byte offset."""
+        fh = self._get_file_handle(file)
+        fh.seek(offset)
         line = fh.readline()
         return json.loads(line.decode("utf-8"))
+
+    def _read_entry(self, idx: int) -> dict:
+        """Read entry text. Handles both normal and merged entries."""
+        entry = self.entries[idx]
+
+        if "parts" in entry:
+            # Merged entry: read each part and join with \n\n
+            texts = []
+            for part in entry["parts"]:
+                record = self._read_record(part["file"], part["offset"])
+                texts.append(record.get("text", ""))
+            return {"text": "\n\n".join(t for t in texts if t)}
+
+        return self._read_record(entry["file"], entry["offset"])
+
+    def _is_merged(self, idx: int) -> bool:
+        """Check if entry is a merged chunk (artificial \n\n boundary)."""
+        return "parts" in self.entries[idx]
 
     def _get_task_type(self, idx: int) -> str:
         """Deterministic task assignment based on sample index and epoch.
 
-        Uses modular arithmetic to guarantee:
-            - Each sample trains with each task exactly once per 3-epoch cycle.
-            - Within any single epoch, tasks are perfectly balanced (1/3 each).
-            - The epoch // 3 shift varies the starting task across cycles.
+        Entries with a next chunk: 3-task rotation (NTP, reconstruction,
+        continuation). Each sample trains with each task exactly once per
+        3-epoch cycle. The epoch // 3 shift varies starting task across cycles.
+
+        Entries without a next chunk: 2-task rotation (NTP, reconstruction).
+        Each sample alternates between the two tasks every epoch.
         """
         epoch = self._current_epoch
-        task_idx = (idx + epoch + epoch // 3) % 3
-        return TASK_TYPES[task_idx]
+        if idx in self._has_next:
+            task_idx = (idx + epoch + epoch // 3) % 3
+            return TASK_TYPES_3[task_idx]
+        else:
+            task_idx = (idx + epoch) % 2
+            return TASK_TYPES_2[task_idx]
 
     def _sample_n_mem(self, task_type: str) -> int:
         """Sample n_mem based on task type.
@@ -141,48 +192,42 @@ class KawaiiDataset(Dataset):
             return 0
         return random.randint(1, self.num_mem_tokens)
 
-    # Minimum characters per half when splitting for synthetic continuation.
-    # Texts shorter than 2x this or without a valid \n split point fall back
-    # to NTP.
-    _MIN_SPLIT_CHARS = 256
+    def _should_add_eos(self, idx: int, task_type: str) -> bool:
+        """Determine whether to append EOS token.
 
-    @staticmethod
-    def _split_text(text: str, min_chars: int = 256) -> Optional[Tuple[str, str]]:
-        """Try to split text at a newline for synthetic continuation.
-
-        Returns (context, target) if a good split is found, None otherwise.
-        A "good split" requires:
-            1. The text contains at least one ``\\n``.
-            2. Both halves are at least *min_chars* characters long.
-
-        Among valid newlines, picks the one closest to the midpoint.
+        - Merged entries: never (artificial boundary from chunk merging).
+        - NTP non-merged, has next: no EOS (document continues).
+        - NTP non-merged, no next: EOS (document ends).
+        - Reconstruction non-merged: always EOS (complete reconstruction).
+        - Continuation target has next: no EOS (text continues).
+        - Continuation target is last: EOS (document ends).
         """
-        if len(text) < min_chars * 2:
-            return None
+        if self._is_merged(idx):
+            return False
+        if task_type == "reconstruction":
+            # Reconstruction always needs EOS: the model should learn to
+            # reconstruct the complete text from compressed memory.
+            return True
+        if task_type == "ntp":
+            # EOS only if this entry is a genuine document end
+            return idx not in self._has_next
+        if task_type == "continuation":
+            # EOS depends on whether the TARGET chunk has further continuation
+            tgt_idx = self._continuation_map[idx]
+            return tgt_idx not in self._continuation_map
+        raise ValueError(f"Unknown task type: {task_type}")
 
-        mid = len(text) // 2
-
-        # Find newline positions that leave both halves >= min_chars
-        candidates = [
-            i for i, c in enumerate(text)
-            if c == "\n" and i >= min_chars and len(text) - i - 1 >= min_chars
-        ]
-
-        if not candidates:
-            return None
-
-        best = min(candidates, key=lambda pos: abs(pos - mid))
-        return text[:best + 1], text[best + 1:]
-
-    def _build_ntp_sample(self, text: str) -> dict:
+    def _build_ntp_sample(self, text: str, add_eos: bool) -> dict:
         """Build a pure NTP sample (no MemE involvement)."""
+        reserved = 1 if add_eos else 0
         target_ids = self.tokenizer.encode(
             text,
             add_special_tokens=False,
-            max_length=self.target_max_length - 1,  # reserve for EOS
+            max_length=self.target_max_length - reserved,
             truncation=True,
         )
-        target_ids = target_ids + [self.tokenizer.eos_token_id]
+        if add_eos:
+            target_ids = target_ids + [self.tokenizer.eos_token_id]
         input_ids = torch.tensor(target_ids, dtype=torch.long)
         labels = input_ids.clone()
         # Minimal context placeholder (ignored since n_mem=0)
@@ -204,42 +249,33 @@ class KawaiiDataset(Dataset):
 
         For NTP: pure language modeling, no MemE, n_mem=0.
         For reconstruction: input_ids starts with <AE> token as task signal.
-        For continuation: input_ids has no prefix (target text only).
+        For continuation: uses real next chunk as target.
 
         Returns:
             dict with:
-                context_ids: [L_ctx] — tokenized context for MemE (minimal for NTP)
-                input_ids: [T] — tokenized target for LLM (may start with <AE>)
-                labels: [T] — labels (IGNORE for <AE> position, real for rest)
-                n_mem: int — number of latent tokens (0 for NTP)
+                context_ids: [L_ctx] -- tokenized context for MemE (minimal for NTP)
+                input_ids: [T] -- tokenized target for LLM (may start with <AE>)
+                labels: [T] -- labels (IGNORE for <AE> position, real for rest)
+                n_mem: int -- number of latent tokens (0 for NTP)
         """
         task_type = self._get_task_type(idx)
         record = self._read_entry(idx)
         text = record.get("text", "")
+        add_eos = self._should_add_eos(idx, task_type)
 
         # --- NTP path ---
         if task_type == "ntp":
-            return self._build_ntp_sample(text)
+            return self._build_ntp_sample(text, add_eos=add_eos)
 
-        # --- Continuation path ---
+        # --- Continuation path (always has real next chunk) ---
         if task_type == "continuation":
-            if idx in self._continuation_map:
-                # Natural continuation: context = this chunk, target = next chunk
-                target_idx = self._continuation_map[idx]
-                target_record = self._read_entry(target_idx)
-                context_text = text
-                target_text = target_record.get("text", "")
-            else:
-                # Synthetic continuation: try to split at a newline boundary
-                split = self._split_text(text, self._MIN_SPLIT_CHARS)
-                if split is not None:
-                    context_text, target_text = split
-                else:
-                    # Text too short or no valid \n — fall back to NTP
-                    return self._build_ntp_sample(text)
+            target_idx = self._continuation_map[idx]
+            target_record = self._read_entry(target_idx)
+            context_text = text
+            target_text = target_record.get("text", "")
 
         # --- Reconstruction path ---
-        if task_type == "reconstruction":
+        elif task_type == "reconstruction":
             context_text = text
             target_text = text
 
@@ -251,17 +287,6 @@ class KawaiiDataset(Dataset):
             max_length=self.context_max_length,
             truncation=True,
         )
-
-        # Determine EOS policy:
-        # - Reconstruction: always add EOS
-        # - Continuation: check if TARGET chunk has further continuation
-        #   - target has next chunk: no EOS
-        #   - target is last chunk / synthetic split: add EOS
-        add_eos = True
-        if task_type == "continuation" and idx in self._continuation_map:
-            tgt_idx = self._continuation_map[idx]
-            if tgt_idx in self._continuation_map:
-                add_eos = False
 
         # Tokenize target (for LLM)
         # Reserve 1 token for EOS (if needed) and 1 more for <AE> in reconstruction

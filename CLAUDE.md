@@ -62,7 +62,7 @@ python src/merge_and_shuffle.py \
 ```
 src/train/
 ├── arguments.py       # ModelArguments, DataArguments, TrainingArguments
-├── build_index.py     # Standalone: scan formatted JSONL -> byte-offset index
+├── build_index.py     # Standalone: scan JSONL -> index, upsample, merge short orphans
 ├── model.py           # KawaiiLLMModel (MemE + Projector + LLM)
 ├── dataset.py         # KawaiiDataset with byte-offset access + deterministic task rotation
 ├── collator.py        # Left-pad context, right-pad target, collect per-sample n_mem
@@ -81,7 +81,9 @@ python src/train/build_index.py \
   --data_dirs data/novels/formatted data/bilibili/formatted \
     data/moegirl/formatted data/games/formatted \
     data/general/formatted data/math/formatted data/code/formatted \
-  --output_path data/train_index.json
+  --output_path data/train_index.json \
+  --upsample moegirl:3 \
+  --merge_max_tokens 3500 --merge_short_threshold 2048
 ```
 
 **Step 2: Launch training** (8x A800 80GB):
@@ -91,7 +93,7 @@ bash configs/train_8xa800.sh
 Edit paths in `train_8xa800.sh` before running (`meme_model_name_or_path`, `llm_model_name_or_path`).
 
 ### Key Design Decisions
-- **3-task deterministic rotation**: NTP (n_mem=0, no MemE), reconstruction (<AE>), continuation — each 1/3, cycled per sample every 3 epochs via `(idx + epoch + epoch//3) % 3`.
+- **2/3-task deterministic rotation**: Entries with next chunk: 3-task (NTP, reconstruction, continuation) via `(idx + epoch + epoch//3) % 3`. Entries without: 2-task (NTP, reconstruction) via `(idx + epoch) % 2`. No fallback logic.
 - **Per-component LR**: projector+mem_embeddings ~1e-3, MemE ~1e-6, LLM ~1e-6.
 - **MemE frozen by default**: runs under `torch.no_grad()`, no gradient checkpointing needed.
 - **Context left-padded** (MemE padding_side='left'), target right-padded (standard causal LM).

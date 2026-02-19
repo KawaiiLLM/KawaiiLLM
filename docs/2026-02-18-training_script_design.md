@@ -57,8 +57,14 @@ Three `@dataclass` groups parsed by `HfArgumentParser`:
 
 ## Step 2: Build Index (`src/train/build_index.py`)
 
-Standalone script. Scans all formatted JSONL files in binary mode (`rb`) and records byte offset per line.
-Scanning 33GB JSONL ≈ 60s I/O. Output index file ~200-400MB.
+Standalone script. Scans all formatted JSONL files in binary mode (`rb`), records byte offset per line, optionally upsamples small sources, and merges short orphan chunks.
+
+**Pipeline:**
+1. Scan all JSONL files → entries with byte offsets
+2. **Upsample** specified sources (e.g., `moegirl:3` repeats moegirl entries 3×)
+3. Build continuation pairs (`B.split == A.split + 1`, same `source` + `id`)
+4. **Merge short orphans**: orphan entries (no prev, no next, tokens < threshold) grouped by source and greedily merged up to `merge_max_tokens`. Merged entries use `"parts"` field instead of `"file"`/`"offset"`.
+5. Rebuild continuation pairs on final entries (indices may have shifted after merge)
 
 **Output Format** (`data/train_index.json`):
 
@@ -66,6 +72,8 @@ Scanning 33GB JSONL ≈ 60s I/O. Output index file ~200-400MB.
 {
   "entries": [
     {"source": "novels", "id": "123", "split": 0, "tokens": 4056, "file": "/abs/path.jsonl", "offset": 0},
+    {"source": "moegirl", "id": "merged_17", "split": 0, "tokens": 3200,
+     "parts": [{"file": "/path/moegirl.jsonl", "offset": 1000}, {"file": "/path/moegirl.jsonl", "offset": 2000}]},
     ...
   ],
   "continuation_pairs": [[idx_A, idx_B], ...],
@@ -74,14 +82,14 @@ Scanning 33GB JSONL ≈ 60s I/O. Output index file ~200-400MB.
 }
 ```
 
-* `continuation_pairs`: pairs where `B.split == A.split + 1`, same `source` + `id`.
-
 **CLI Command:**
 
 ```bash
 python src/train/build_index.py \
   --data_dirs data/novels/formatted data/bilibili/formatted ... \
-  --output_path data/train_index.json
+  --output_path data/train_index.json \
+  --upsample moegirl:3 \
+  --merge_max_tokens 3500 --merge_short_threshold 2048
 ```
 
 ---
@@ -194,39 +202,48 @@ return llm(inputs_embeds=llm_input, attention_mask=..., labels=labels)
 2. **Reconstruction (AE):** `context` = text → MemE → latent → LLM（带 `<AE>` 信号）→ `same text`
 3. **Continuation (AR):** `split_x` → MemE → latent → LLM → `split_{x+1}`
 
-### Task Assignment — 确定性轮换
+### Task Assignment — 2/3-task 确定性轮换
 
-每个样本在每个 epoch 被确定性分配到一种任务。每连续 3 个 epoch 内完整覆盖三种任务：
+任务分配根据样本是否有下一 chunk 区分：
 
 ```python
-TASK_TYPES = ["ntp", "reconstruction", "continuation"]
+TASK_TYPES_3 = ["ntp", "reconstruction", "continuation"]
+TASK_TYPES_2 = ["ntp", "reconstruction"]
 
 def _get_task_type(self, idx):
     epoch = self._current_epoch
-    task_idx = (idx + epoch + epoch // 3) % 3
-    return TASK_TYPES[task_idx]
+    if idx in self._has_next:
+        task_idx = (idx + epoch + epoch // 3) % 3
+        return TASK_TYPES_3[task_idx]
+    else:
+        task_idx = (idx + epoch) % 2
+        return TASK_TYPES_2[task_idx]
 ```
 
-性质：每 epoch 精确 1/3 × 3 任务；每 3 epoch 周期完整覆盖；`epoch // 3` 避免周期间固定模式。无 warmup。
+- **有下一 chunk**: 3-task 轮转，每 3 epoch 周期完整覆盖
+- **无下一 chunk**: 2-task 轮转，每 2 epoch 交替
+- 续写只分配给有真实 continuation pair 的样本，无 fallback 逻辑
+- 无 warmup，从训练开始即均衡
 
-**续写来源**：
-1. **自然续写**: 有 continuation pair → 使用下一 chunk
-2. **合成续写**: 无 pair → 在 `\n` 处切分（最小分割 256 字符，双侧均需满足）
-3. **回退**: 无法续写时回退为 NTP（不回退为重建，避免膨胀特定任务）
+**Merged entries**: `build_index.py` 合并的短孤立 chunk 有 `"parts"` 字段，`_read_entry()` 逐个读取并用 `\n\n` 拼接。合并 entry 无 next chunk，走 2-task 轮转。
 
 **`<AE>` per-sample 实现**: 重建任务在 `input_ids` 前端插入 `<AE>` token（label 为 IGNORE），续写和 NTP 不加。三种任务可在同一 batch 内混合。
 
 ### EOS Token 策略
 
-| 任务类型 | target 有后续 chunk | EOS 处理 |
-|:---|:---|:---|
-| NTP | — | **始终加 EOS** |
-| 重建 | 无所谓 | **始终加 EOS** |
-| 续写（自然） | 有 | **不加 EOS** |
-| 续写（自然） | 无（末尾 chunk） | **加 EOS** |
-| 续写（合成切分） | — | **加 EOS** |
+EOS 仅在文本真正结束时添加。Merged entries（人工拼接边界）不加 EOS；重建任务始终加 EOS（完整还原）；NTP 和续写根据是否有后续 chunk 决定。
 
-判断依据是 **target chunk** 是否还有后续（而非 context chunk）。
+| 任务类型 | 条件 | EOS |
+|:---|:---|:---|
+| NTP | merged entry | 不加 |
+| | 非 merged，有后续 chunk | 不加 |
+| | 非 merged，无后续 chunk | 加 |
+| 重建 | merged entry | 不加 |
+| | 非 merged | 加 |
+| 续写 | target 有后续 chunk | 不加 |
+| （仅非 merged） | target 无后续 chunk | 加 |
+
+由 `_should_add_eos(idx, task_type)` 统一判断。
 
 ### Data Access
 
@@ -413,10 +430,11 @@ deepspeed --num_gpus 8 src/train/train.py \
 | MemE hidden_size | 3584 | **2560** (动态读取) | 原计划误用了 Qwen2.5-7B 的值；代码通过 `meme.config.hidden_size` 动态获取 |
 | **Special tokens** | 无 | `<mem>`, `</mem>`, `<mempad>`, `<AE>` 动态注册 + embedding resize | README 设计要求区分任务模式和标记 memory 边界 |
 | **Projector 架构** | `Linear→GELU→Linear` | `RMSNorm(meme_dim) → Linear(meme_dim, meme_dim*4) → GELU → Linear(meme_dim*4, llm_dim)` | 参考 PCC/Qwen2.5-VL 共识设计，RMSNorm 稳定输入 |
-| **任务设计** | 2 任务 (重建+续写) | 3 任务 (NTP+重建+续写)，确定性轮换，各 1/3 | NTP 独立承担领域知识内化；无 warmup |
-| **任务分配** | 概率采样 + warmup | `(idx + epoch + epoch//3) % 3` 确定性轮换，每 3 epoch 完整覆盖 | 均衡、可复现、无随机性 |
+| **任务设计** | 2 任务 (重建+续写) | 3 任务 (NTP+重建+续写)，2/3-task 确定性轮换 | NTP 独立承担领域知识内化；无 warmup |
+| **任务分配** | 概率采样 + warmup | 有 next chunk: `(idx+epoch+epoch//3)%3`; 无: `(idx+epoch)%2` | 续写只给有真实 pair 的样本，无 fallback |
 | **n_mem 策略** | 3-phase 阶梯 per-batch | NTP: 0; 重建/续写: uniform [1,128] | NTP 独立处理知识内化，MemE 任务专注压缩能力 |
-| **EOS Token 策略** | 未明确 | 条件性添加：NTP/重建始终加；自然续写按 target 是否有后续决定；合成续写加 | 让模型学习区分"文本结束"vs"文本继续" |
+| **EOS Token 策略** | 未明确 | merged 不加 EOS；重建始终加 EOS；NTP/续写根据 has_next 决定 | 避免在人工边界教 EOS，重建需完整还原信号 |
+| **build_index** | 纯扫描 | 支持上采样 (`--upsample`) + 短孤立 chunk 合并 (`--merge`) | 平衡小数据源曝光，减少 padding 浪费 |
 | **Phase 1 freeze_meme** | `--freeze_meme True` | `--freeze_meme False` | README 阶段 1 = 全参数训练，MemE 用极低 LR |
 | Per-component LR | 未包含 | `meme_lr`, `llm_lr`, `projector_lr` in `ModelArguments`; `create_optimizer()` 分组实现 | 随机初始化组件和预训练组件需差异化 LR |
 | Frozen MemE 处理 | `gradient_checkpointing_enable()` 对所有组件 | Frozen MemE 在 `torch.no_grad()` 下运行，跳过 gradient checkpointing；输出 `detach().requires_grad_(True)` | 冻结模型无需 checkpointing |

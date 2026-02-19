@@ -470,23 +470,29 @@ L_TC = -1/(n-k) * Σ log P(x_i | h_e, x_k, ..., x_{i-1})
 
 三种任务通过确定性轮换均衡分配（各 1/3），详见下文"任务分配"。
 
-##### 任务分配 — 确定性轮换
+##### 任务分配 — 2/3-task 确定性轮换
 
-每个样本在每个 epoch 被确定性地分配到一种任务。每连续 3 个 epoch 内，每个样本恰好训练一次 NTP、一次重建、一次续写：
+任务分配根据样本是否有下一 chunk 区分：
 
+**有下一 chunk 的样本** — 3-task 轮转（NTP / 重建 / 续写）：
 ```python
-TASK_TYPES = ["ntp", "reconstruction", "continuation"]
+TASK_TYPES_3 = ["ntp", "reconstruction", "continuation"]
 task_idx = (sample_idx + epoch + epoch // 3) % 3
-task = TASK_TYPES[task_idx]
 ```
+- 每 3-epoch 周期内完整覆盖三种任务
+- `epoch // 3` 项使不同周期的起始任务不同
+
+**无下一 chunk 的样本** — 2-task 轮转（NTP / 重建）：
+```python
+TASK_TYPES_2 = ["ntp", "reconstruction"]
+task_idx = (sample_idx + epoch) % 2
+```
+- 每 2-epoch 周期内完整覆盖两种任务
+- 续写只分配给有真实 continuation pair 的样本，无 fallback 逻辑
 
 性质：
-- 每个 epoch 内，三种任务占比精确 1/3（因为 `idx % 3` 均匀分布）
-- 每 3-epoch 周期内，每个样本完整覆盖三种任务
-- `epoch // 3` 项使不同周期的起始任务不同，避免固定模式
-- 无 warmup，从训练开始即三种任务均衡
-
-**续写来源**：有 continuation pair 的样本使用自然下一 chunk；无 pair 的在 `\n` 处合成切分（最小分割长度 256 字符，双侧均需满足）。无法续写时回退为 NTP。
+- 无 warmup，从训练开始即所有任务均衡
+- 全局任务比例取决于有 continuation pair 的样本占比（合并前约 12.2%，合并短孤立 chunk 后比例上升至 27.1%，因为分母减小而分子不变）
 
 **Per-sample n_mem**
 
@@ -508,17 +514,19 @@ Pure NTP batch（`max_n_mem=0`）跳过 MemE 计算；混合 batch 仅对非 NTP
 
 **`<AE>` per-sample 任务信号**：重建任务在 LLM 的 `input_ids` 前端插入 `<AE>` token，续写和 NTP 不加。同一 batch 内可混合三种任务。
 
-**EOS Token 策略：条件性添加**
+**EOS Token 策略：仅在文本真正结束时添加**
 
-| 任务类型 | target 有后续 chunk | EOS 处理 |
+EOS 只在文本真正结束时添加。合并 chunk（人工 `\n\n` 拼接边界）不加 EOS；重建任务始终加 EOS（完整还原）；NTP 和续写根据是否有后续 chunk 决定。
+
+| 任务类型 | 条件 | EOS |
 |:---|:---|:---|
-| NTP | — | **始终加 EOS** |
-| 重建 | 无所谓 | **始终加 EOS**（完整复现原文） |
-| 续写（自然） | 有 | **不加 EOS**（target 后文本继续） |
-| 续写（自然） | 无（target 是末尾 chunk） | **加 EOS**（文本结束） |
-| 续写（合成切分） | — | **加 EOS**（强制断点） |
-
-判断依据是 **target chunk** 是否还有后续（而非 context chunk）。
+| **NTP** | merged entry | **不加**（人工拼接边界） |
+| | 非 merged，有后续 chunk | **不加**（文本还没结束） |
+| | 非 merged，无后续 chunk | **加 EOS**（文档自然结束） |
+| **重建** | merged entry | **不加**（同上） |
+| | 非 merged | **加 EOS**（完整还原，含结束信号） |
+| **续写** | target 有后续 chunk | **不加**（文本继续） |
+| （仅非 merged 参与） | target 无后续 chunk | **加 EOS**（文档结束） |
 
 **三任务设计空间**
 
@@ -546,6 +554,22 @@ Pure NTP batch（`max_n_mem=0`）跳过 MemE 计算；混合 batch 仅对非 NTP
 |**general**|943,816|913,909|893,567|20,342|2.4|29,907|3.2%|
 |**math**|1,042,041|1,040,205|1,038,971|1,234|2.5|1,836|0.2%|
 |**合计**|**4,835,073**|—|—|—|—|**590,073**|**12.2%**|
+
+##### 数据索引优化
+
+`build_index.py` 在构建索引时支持两种优化：
+
+**上采样小数据源**：萌娘百科等高价值但数据量小的 source 可按倍率上采样，增加 NTP 曝光频率以加强知识记忆。上采样的 entries 在不同 index 位置会分配到不同任务，保持多样性。
+
+```bash
+python src/train/build_index.py --upsample moegirl:3 games:2
+```
+
+**合并短孤立 chunk**：孤立样本（无 prev 且无 next chunk）中 token 数低于阈值的，按同 source 贪心合并为一个 entry（用 `\n\n` 拼接），减少 padding 浪费。合并后的 entry 自然走 2-task 轮转（NTP + 重建）。
+
+```bash
+python src/train/build_index.py --merge_max_tokens 3500 --merge_short_threshold 2048
+```
 ##### 训练流程
 
 Qwen3-Embedding 已经过对比学习预训练，具备强语义理解能力，无需像 Qwen2.5-VL 那样从头训练 ViT。但新加入的 128 个 MEM token embeddings 和 Projector 是随机初始化的，需要差异化学习率策略来处理冷启动问题（类似 LLaVA / Qwen-VL 早期版本的做法）。
