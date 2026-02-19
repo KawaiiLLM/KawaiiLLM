@@ -90,3 +90,19 @@ class TrainingArguments(HfTrainingArguments):
         default=True,
         metadata={"help": "Enable gradient checkpointing to save memory."},
     )
+    dataloader_persistent_workers: bool = field(
+        default=False,
+        metadata={
+            "help": "Must be False. Deterministic task rotation requires "
+            "workers to re-fork each epoch to pick up the updated epoch."
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dataloader_persistent_workers:
+            raise ValueError(
+                "dataloader_persistent_workers=True is incompatible with "
+                "deterministic task rotation. Epoch updates won't propagate "
+                "to persistent workers."
+            )

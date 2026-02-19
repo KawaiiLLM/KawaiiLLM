@@ -17,30 +17,33 @@ logger = logging.getLogger(__name__)
 
 
 class CurriculumCallback(TrainerCallback):
-    """Updates training progress on dataset and collator each step."""
+    """Updates current epoch on dataset for deterministic task rotation.
 
-    def __init__(self, dataset, collator):
+    Each sample is assigned exactly one task per epoch. Over every 3
+    consecutive epochs, each sample trains once with each task
+    (NTP, reconstruction, continuation).
+    """
+
+    def __init__(self, dataset):
         self.dataset = dataset
-        self.collator = collator
 
     def on_train_begin(self, args, state, control, **kwargs):
-        """Restore curriculum progress when resuming from checkpoint."""
-        if state.global_step > 0 and state.max_steps > 0:
-            progress = state.global_step / state.max_steps
-            self.dataset.set_training_progress(progress)
-            self.collator.set_training_progress(progress)
-            logger.info(
-                "Restored curriculum progress: %.2f%% (step %d/%d)",
-                progress * 100, state.global_step, state.max_steps,
-            )
+        """Restore epoch when resuming from checkpoint.
 
-    def on_step_begin(self, args, state, control, **kwargs):
-        if state.max_steps > 0:
-            progress = state.global_step / state.max_steps
-        else:
-            progress = 0.0
-        self.dataset.set_training_progress(progress)
-        self.collator.set_training_progress(progress)
+        Note: on_epoch_begin will also fire shortly after, but setting
+        the epoch here ensures correctness if any code accesses the
+        dataset between on_train_begin and on_epoch_begin.
+        """
+        if state.epoch is not None and state.epoch > 0:
+            epoch = int(state.epoch)
+            self.dataset.set_current_epoch(epoch)
+            logger.info("Restored task rotation at epoch %d", epoch)
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        """Update dataset epoch for deterministic task rotation."""
+        epoch = int(state.epoch) if state.epoch is not None else 0
+        self.dataset.set_current_epoch(epoch)
+        logger.info("Epoch %d: task rotation updated", epoch)
 
 
 class KawaiiTrainer(Trainer):
@@ -59,17 +62,26 @@ class KawaiiTrainer(Trainer):
         super().__init__(**kwargs)
 
     def get_train_dataloader(self) -> DataLoader:
-        """Override to inject worker_init_fn for file handle safety."""
+        """Override to inject worker_init_fn for file handle safety.
+
+        Composes with HF Trainer's seed_worker to preserve torch/numpy
+        seed initialization while also resetting file handles and RNG.
+        """
         dataloader = super().get_train_dataloader()
         if isinstance(self.train_dataset, KawaiiDataset):
-            dataloader.worker_init_fn = KawaiiDataset.worker_init_fn
+            original_init = dataloader.worker_init_fn
+
+            def combined_init(worker_id):
+                if original_init is not None:
+                    original_init(worker_id)
+                KawaiiDataset.worker_init_fn(worker_id)
+
+            dataloader.worker_init_fn = combined_init
         return dataloader
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Extract n_mem from inputs and call model.forward()."""
-        n_mem = inputs.pop("n_mem")
-        if isinstance(n_mem, torch.Tensor):
-            n_mem = n_mem.item()
+        n_mem = inputs.pop("n_mem")  # [B] tensor
 
         outputs = model(
             context_ids=inputs["context_ids"],

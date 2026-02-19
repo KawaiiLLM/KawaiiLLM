@@ -18,7 +18,7 @@ Special tokens:
 
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -186,10 +186,16 @@ class KawaiiLLMModel(nn.Module):
 
         Input layout: [text_tokens (left-padded)] [<mem>] [Q_1, ..., Q_n] [</mem>]
 
+        When called with per-sample n_mem, forward() passes max(n_mem) here.
+        All Q tokens interact through MemE self-attention; forward() then
+        selects the first n_mem[i] outputs per sample. This means Q tokens
+        see more peers during training than at inference with exact n_mem.
+        Accepted trade-off vs. the complexity of per-sample MemE attention masks.
+
         Args:
             context_ids: [B, L] — tokenized context (left-padded).
             context_attention_mask: [B, L] — 1 for real tokens, 0 for padding.
-            n_mem: number of MEM tokens to use this batch.
+            n_mem: number of MEM tokens to use (max across batch).
 
         Returns:
             mem_hidden: [B, n_mem, meme_hidden] — compressed memory vectors.
@@ -239,17 +245,23 @@ class KawaiiLLMModel(nn.Module):
             [context_attention_mask, extra_mask], dim=1
         )  # [B, L+1+n_mem+1]
 
+        # Build position_ids from attention mask (handles left-padded context)
+        position_ids = extended_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(extended_mask == 0, 0)
+
         # Run through MemE — optionally without grad if frozen
         if self._freeze_meme:
             with torch.no_grad():
                 outputs = self.meme(
                     inputs_embeds=combined,
                     attention_mask=extended_mask,
+                    position_ids=position_ids,
                 )
         else:
             outputs = self.meme(
                 inputs_embeds=combined,
                 attention_mask=extended_mask,
+                position_ids=position_ids,
             )
 
         # Extract MEM token hidden states: skip </mem> at -1, take n_mem before it
@@ -270,25 +282,34 @@ class KawaiiLLMModel(nn.Module):
         input_ids: torch.LongTensor,
         attention_mask: torch.LongTensor,
         labels: torch.LongTensor,
-        n_mem: int,
+        n_mem: Union[int, torch.LongTensor],
         **kwargs,
     ):
         """Full forward pass: encode context -> project -> decode with LLM.
 
-        LLM input layout (task-agnostic prefix + per-sample target):
-            [<mem>] [h_1, ..., h_N] [</mem>] [input_ids...]
+        Supports three task types via per-sample n_mem:
+            - NTP (n_mem=0): pure language modeling, no MemE, no prefix.
+            - Reconstruction/Continuation (n_mem>0): MemE + projected prefix.
+
+        For non-NTP samples, the prefix is left-padded so that <mem>, valid
+        latent tokens, and </mem> are right-aligned and contiguous.
+
+        LLM input layout per sample:
+            NTP:   [input_ids...]
+            Other: [pad...] [<mem>] [h_1, ..., h_ni] [</mem>] [input_ids...]
 
         The <AE> task signal is embedded in input_ids by the dataset:
             Reconstruction: input_ids = [<AE>, target_tokens...]
             Continuation:   input_ids = [target_tokens...]
+            NTP:            input_ids = [target_tokens...]
 
         Args:
-            context_ids: [B, L_ctx] — context tokens (left-padded).
+            context_ids: [B, L_ctx] — context tokens (left-padded; minimal for NTP).
             context_attention_mask: [B, L_ctx] — context attention mask.
             input_ids: [B, T] — target tokens (right-padded, may start with <AE>).
             attention_mask: [B, T] — target attention mask.
             labels: [B, T] — target labels with IGNORE_INDEX for padding/<AE>.
-            n_mem: int — number of MEM tokens for this batch.
+            n_mem: [B] tensor or int — number of MEM tokens per sample (0 for NTP).
 
         Returns:
             CausalLMOutputWithPast with loss.
@@ -296,55 +317,119 @@ class KawaiiLLMModel(nn.Module):
         B = input_ids.shape[0]
         device = input_ids.device
         llm_embed = self.llm.get_input_embeddings()
+        llm_hidden = self.llm.config.hidden_size
 
-        # 1. Encode context through MemE
-        mem_hidden = self.encode_context(
-            context_ids, context_attention_mask, n_mem
-        )  # [B, n_mem, meme_hidden]
+        # Normalize n_mem to a [B] tensor
+        if isinstance(n_mem, int):
+            n_mem = torch.full((B,), n_mem, dtype=torch.long, device=device)
+        else:
+            n_mem = n_mem.to(device)
+        max_n_mem = n_mem.max().item()
 
-        # 2. Project to LLM dimension
-        projected = self.projector(mem_hidden)  # [B, n_mem, llm_hidden]
+        # Get target embeddings from LLM's embedding layer
+        target_embeds = llm_embed(input_ids)  # [B, T, llm_hidden]
 
-        # 3. Build LLM prefix: [<mem>, h_1..h_N, </mem>]
+        if max_n_mem == 0:
+            # --- Pure NTP batch: skip MemE entirely, no prefix ---
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            return self.llm(
+                inputs_embeds=target_embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                position_ids=position_ids,
+            )
+
+        # --- Mixed or full MemE batch ---
+
+        # 1. Encode context through MemE — only for non-NTP samples
+        non_ntp_mask = n_mem > 0  # [B]
+        if non_ntp_mask.all():
+            mem_hidden = self.encode_context(
+                context_ids, context_attention_mask, max_n_mem
+            )
+            projected = self.projector(mem_hidden)  # [B, max_n_mem, llm_hidden]
+        else:
+            # Only encode non-NTP samples to avoid wasting MemE compute
+            mem_idx = non_ntp_mask.nonzero(as_tuple=True)[0]
+            mem_hidden = self.encode_context(
+                context_ids[mem_idx],
+                context_attention_mask[mem_idx],
+                max_n_mem,
+            )
+            projected_sub = self.projector(mem_hidden)
+            projected = projected_sub.new_zeros(B, max_n_mem, projected_sub.size(-1))
+            projected[mem_idx] = projected_sub
+
+        # 2. Build per-sample left-padded prefix
         mem_start_id = torch.tensor(
             [self._mem_token_id], device=device, dtype=torch.long
         )
         mem_end_id = torch.tensor(
             [self._mem_end_token_id], device=device, dtype=torch.long
         )
-        mem_start_emb = llm_embed(mem_start_id).unsqueeze(0).expand(B, -1, -1)  # [B, 1, llm_hidden]
-        mem_end_emb = llm_embed(mem_end_id).unsqueeze(0).expand(B, -1, -1)  # [B, 1, llm_hidden]
+        mem_start_emb = llm_embed(mem_start_id).squeeze(0)  # [llm_hidden]
+        mem_end_emb = llm_embed(mem_end_id).squeeze(0)  # [llm_hidden]
 
-        prefix_embeds = torch.cat(
-            [mem_start_emb, projected, mem_end_emb], dim=1
-        )  # [B, prefix_len, llm_hidden]
-        prefix_len = 1 + n_mem + 1  # <mem> + projected + </mem>
+        max_prefix_len = max_n_mem + 2  # <mem>(1) + max_n_mem + </mem>(1)
+        prefix_embeds_list = []
+        prefix_mask_list = []
 
-        # 4. Get target embeddings from LLM's embedding layer
-        target_embeds = llm_embed(input_ids)  # [B, T, llm_hidden]
+        for i in range(B):
+            ni = n_mem[i].item()
 
-        # 5. Concatenate: [prefix, target_text]
+            if ni == 0:
+                # NTP sample in mixed batch: entire prefix is masked padding
+                prefix_embeds_list.append(
+                    torch.zeros(max_prefix_len, llm_hidden, device=device, dtype=projected.dtype)
+                )
+                prefix_mask_list.append(
+                    torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
+                )
+            else:
+                pad_len = max_n_mem - ni
+                parts = []
+                if pad_len > 0:
+                    parts.append(
+                        torch.zeros(pad_len, llm_hidden, device=device, dtype=projected.dtype)
+                    )
+                parts.append(mem_start_emb.unsqueeze(0))   # [1, llm_hidden]
+                parts.append(projected[i, :ni])             # [ni, llm_hidden]
+                parts.append(mem_end_emb.unsqueeze(0))      # [1, llm_hidden]
+                prefix_embeds_list.append(torch.cat(parts, dim=0))
+
+                mask = torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
+                mask[pad_len:] = 1
+                prefix_mask_list.append(mask)
+
+        prefix_embeds = torch.stack(prefix_embeds_list)  # [B, max_prefix_len, llm_hidden]
+        prefix_attn = torch.stack(prefix_mask_list)      # [B, max_prefix_len]
+
+        # 3. Concatenate: [prefix, target_text]
         llm_input = torch.cat([prefix_embeds, target_embeds], dim=1)
 
-        # 6. Build labels: IGNORE for prefix positions, real labels for target
+        # 4. Build labels: IGNORE for all prefix positions, real labels for target
         ignore_prefix = torch.full(
-            (B, prefix_len), IGNORE_INDEX,
+            (B, max_prefix_len), IGNORE_INDEX,
             dtype=labels.dtype, device=device,
         )
         llm_labels = torch.cat([ignore_prefix, labels], dim=1)
 
-        # 7. Build attention mask for full sequence
-        prefix_attn = torch.ones(
-            B, prefix_len,
-            dtype=attention_mask.dtype, device=device,
-        )
+        # 5. Build attention mask for full sequence
         llm_attn_mask = torch.cat([prefix_attn, attention_mask], dim=1)
 
-        # 8. Forward through LLM
+        # 6. Build position_ids from attention mask (handles left-padded prefix)
+        # NTP samples: prefix is all-masked, so position starts at target tokens.
+        # Non-NTP: <mem> starts at position 0 regardless of padding.
+        position_ids = llm_attn_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(llm_attn_mask == 0, 0)
+
+        # 7. Forward through LLM
         outputs = self.llm(
             inputs_embeds=llm_input,
             attention_mask=llm_attn_mask,
             labels=llm_labels,
+            position_ids=position_ids,
         )
 
         return outputs

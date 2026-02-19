@@ -188,44 +188,56 @@ return llm(inputs_embeds=llm_input, attention_mask=..., labels=labels)
 
 ## Step 4: Dataset (`src/train/dataset.py`) — `KawaiiDataset`
 
-**Two Tasks:**
+**Three Tasks:**
 
-1. **Reconstruction (AE):** `context` = text → MemE → latent → LLM（带 `<AE>` 信号）→ `same text`
-2. **Continuation (AR):** `split_x` → MemE → latent → LLM → `split_{x+1}`
+1. **NTP (Next Token Prediction):** 纯语言建模，无 MemE 参与，n_mem=0。
+2. **Reconstruction (AE):** `context` = text → MemE → latent → LLM（带 `<AE>` 信号）→ `same text`
+3. **Continuation (AR):** `split_x` → MemE → latent → LLM → `split_{x+1}`
 
-### Task Assignment — 线性 warmup + 合成续写
+### Task Assignment — 确定性轮换
 
-续写概率在训练前 10% 线性增长到 50%，之后保持 50%。如果选择续写但无自然续写对，则在 `\n` 处切分当前文本合成续写对：
+每个样本在每个 epoch 被确定性分配到一种任务。每连续 3 个 epoch 内完整覆盖三种任务：
 
 ```python
-def _get_task_type(idx, progress):
-    if progress < 0.1:
-        cont_prob = 0.5 * (progress / 0.1)  # 0% -> 50%
-    else:
-        cont_prob = 0.5
+TASK_TYPES = ["ntp", "reconstruction", "continuation"]
 
-    if random.random() < cont_prob:
-        return "continuation"
-    return "reconstruction"
+def _get_task_type(self, idx):
+    epoch = self._current_epoch
+    task_idx = (idx + epoch + epoch // 3) % 3
+    return TASK_TYPES[task_idx]
 ```
 
-续写来源（在 `__getitem__` 中处理）：
+性质：每 epoch 精确 1/3 × 3 任务；每 3 epoch 周期完整覆盖；`epoch // 3` 避免周期间固定模式。无 warmup。
+
+**续写来源**：
 1. **自然续写**: 有 continuation pair → 使用下一 chunk
-2. **合成续写**: 无 continuation pair → 在 `\n` 处切分当前文本（优先选最接近中点的 `\n`）
+2. **合成续写**: 无 pair → 在 `\n` 处切分（最小分割 256 字符，双侧均需满足）
+3. **回退**: 无法续写时回退为 NTP（不回退为重建，避免膨胀特定任务）
 
-效果：50% 续写比例中，有自然续写对的样本使用真实对，无续写对的样本使用合成切分。所有样本都能参与续写任务。
+**`<AE>` per-sample 实现**: 重建任务在 `input_ids` 前端插入 `<AE>` token（label 为 IGNORE），续写和 NTP 不加。三种任务可在同一 batch 内混合。
 
-**`<AE>` per-sample 实现**: 重建任务在 `input_ids` 前端插入 `<AE>` token（label 为 IGNORE），续写任务不加。这样每个样本独立携带任务信号，无需 per-batch task_type。
+### EOS Token 策略
+
+| 任务类型 | target 有后续 chunk | EOS 处理 |
+|:---|:---|:---|
+| NTP | — | **始终加 EOS** |
+| 重建 | 无所谓 | **始终加 EOS** |
+| 续写（自然） | 有 | **不加 EOS** |
+| 续写（自然） | 无（末尾 chunk） | **加 EOS** |
+| 续写（合成切分） | — | **加 EOS** |
+
+判断依据是 **target chunk** 是否还有后续（而非 context chunk）。
 
 ### Data Access
 
 * Load index from `data/train_index.json`.
-* **Random Access:** 使用 binary mode (`rb`) 打开文件，`file.seek(offset)` + `readline()` + `.decode("utf-8")`，确保与 build_index.py 的字节偏移一致。
+* **Random Access:** binary mode (`rb`), `file.seek(offset)` + `readline()` + `.decode("utf-8")`。
 * **File Handle Cache:** Per-file，带 `__del__` 清理。
-* **Worker Safety:** 提供 `worker_init_fn` 静态方法，DataLoader 每个 worker 独立重置文件句柄并 seed RNG。
-* `set_training_progress(float)`: Called by trainer callback.
-* **`__getitem__` returns:** `{"context_ids": Tensor, "input_ids": Tensor, "labels": Tensor}`.
-* *Note: `n_mem` is NOT sampled per-sample — it is sampled per-batch in the collator. `task_type` 不在返回 dict 中——通过 `<AE>` token 在 input_ids 中隐式编码。*
+* **Worker Safety:** `worker_init_fn` 重置文件句柄和 RNG seed。workers 在每个 epoch 开始时重新 fork，能获取到 callback 更新的 `_current_epoch`。
+* `set_current_epoch(int)`: Called by `CurriculumCallback.on_epoch_begin`.
+* **`__getitem__` returns:** `{"context_ids": Tensor, "input_ids": Tensor, "labels": Tensor, "n_mem": int}`.
+* **Per-sample n_mem**：NTP → 0; 重建/续写 → uniform [1, num_mem_tokens]。
+* *`task_type` 不在返回 dict 中——NTP 通过 n_mem=0 区分，重建通过 `<AE>` token 区分。*
 
 ---
 
@@ -233,33 +245,9 @@ def _get_task_type(idx, progress):
 
 * **`context_ids`:** Left-padded (matching MemE's `padding_side='left'`), ensuring MEM tokens always sit at the far right.
 * **`input_ids` / `labels`:** Right-padded (standard causal LM convention).
-* **Samples single `n_mem`** for the entire batch from **线性插值**课程分布（先多后少）。
+* **`n_mem`:** 收集 per-sample n_mem 为 `[B]` tensor（NTP 样本 n_mem=0，重建/续写由 dataset 采样）。
 * **Attention mask 基于实际长度构建**（而非 `.ne(pad_token_id)`），避免当 `pad_token == eos_token` 时真实 EOS token 被错误 mask 的问题。
-* Returns dict with all fields + `n_mem` (scalar int).
-
-**n_mem 采样 — 先多后少，线性插值（无阶梯跳变）:**
-
-```python
-def _sample_n_mem(self) -> int:
-    p = self._training_progress  # 0 → 1
-    N = self.num_mem_tokens_max  # 128
-
-    # 各区间采样概率随 p 线性变化
-    p_high   = 0.7 - 0.6 * p   # P(64-128): 70% → 10%
-    p_mid    = 0.2 + 0.1 * p   # P(16-64):  20% → 30%
-    p_low    = 0.1 + 0.2 * p   # P(2-16):   10% → 30%
-    p_single = 0.3 * p         # P(1):       0% → 30%
-
-    r = random.random()
-    if r < p_high:
-        return random.randint(64, N)
-    elif r < p_high + p_mid:
-        return random.randint(16, 64)
-    elif r < p_high + p_mid + p_low:
-        return random.randint(2, 16)
-    else:
-        return 1
-```
+* Returns dict with all fields + `n_mem` (`[B]` tensor).
 
 **Attention Mask 实现 (length-based, 非 token identity-based):**
 
@@ -284,24 +272,23 @@ Extends `transformers.Trainer`.
 
 ### CurriculumCallback
 
+更新 dataset 的当前 epoch，用于确定性任务轮换。每个 epoch 开始时更新一次，workers 在 epoch 开始时重新 fork 可以获取到最新值。
+
 ```python
 def on_train_begin(self, args, state, control, **kwargs):
-    # 从 checkpoint 恢复时，根据 global_step/max_steps 恢复 curriculum progress
-    if state.global_step > 0 and state.max_steps > 0:
-        progress = state.global_step / state.max_steps
-        self.dataset.set_training_progress(progress)
-        self.collator.set_training_progress(progress)
+    # 从 checkpoint 恢复时，根据 state.epoch 恢复当前 epoch
+    if state.epoch is not None and state.epoch > 0:
+        self.dataset.set_current_epoch(int(state.epoch))
 
-def on_step_begin(self, args, state, control, **kwargs):
-    progress = state.global_step / state.max_steps
-    self.dataset.set_training_progress(progress)
-    self.collator.set_training_progress(progress)
+def on_epoch_begin(self, args, state, control, **kwargs):
+    epoch = int(state.epoch) if state.epoch is not None else 0
+    self.dataset.set_current_epoch(epoch)
 ```
 
 ### KawaiiTrainer Logic
 
 * `get_train_dataloader()`: 注入 `KawaiiDataset.worker_init_fn`，确保多 worker 下文件句柄独立。
-* `compute_loss()`: Extracts `n_mem` from inputs, calls `model.forward()` with all fields.
+* `compute_loss()`: Extracts `n_mem` (`[B]` tensor) from inputs, calls `model.forward()` with all fields.
 * `create_optimizer()`: **Per-component learning rate groups** — 为 meme、llm、projector、mem_embeddings 分别创建 optimizer param groups，区分 weight_decay 和 no_decay 参数。
 * `_save()`: Unwrap DeepSpeed/DDP wrapper, 调用 `model.save_checkpoint()` 分别保存组件 + tokenizer:
 
@@ -426,15 +413,17 @@ deepspeed --num_gpus 8 src/train/train.py \
 | MemE hidden_size | 3584 | **2560** (动态读取) | 原计划误用了 Qwen2.5-7B 的值；代码通过 `meme.config.hidden_size` 动态获取 |
 | **Special tokens** | 无 | `<mem>`, `</mem>`, `<mempad>`, `<AE>` 动态注册 + embedding resize | README 设计要求区分任务模式和标记 memory 边界 |
 | **Projector 架构** | `Linear→GELU→Linear` | `RMSNorm(meme_dim) → Linear(meme_dim, meme_dim*4) → GELU → Linear(meme_dim*4, llm_dim)` | 参考 PCC/Qwen2.5-VL 共识设计，RMSNorm 稳定输入 |
-| **n_mem 课程** | 3-phase 阶梯 (先少后多) | 线性插值 (先多后少): P(64-128)=0.7-0.6p, P(1)=0.3p | README "先多后少" 设计 + 避免阶梯跳变 |
-| **续写任务分配** | 概率采样 (30%/50%) | 线性 warmup (0→50% over 10%) + 合成续写（无自然对时按 `\n` 切分） | 所有样本均可续写；`<AE>` 放入 input_ids 实现 per-sample 任务信号 |
+| **任务设计** | 2 任务 (重建+续写) | 3 任务 (NTP+重建+续写)，确定性轮换，各 1/3 | NTP 独立承担领域知识内化；无 warmup |
+| **任务分配** | 概率采样 + warmup | `(idx + epoch + epoch//3) % 3` 确定性轮换，每 3 epoch 完整覆盖 | 均衡、可复现、无随机性 |
+| **n_mem 策略** | 3-phase 阶梯 per-batch | NTP: 0; 重建/续写: uniform [1,128] | NTP 独立处理知识内化，MemE 任务专注压缩能力 |
+| **EOS Token 策略** | 未明确 | 条件性添加：NTP/重建始终加；自然续写按 target 是否有后续决定；合成续写加 | 让模型学习区分"文本结束"vs"文本继续" |
 | **Phase 1 freeze_meme** | `--freeze_meme True` | `--freeze_meme False` | README 阶段 1 = 全参数训练，MemE 用极低 LR |
 | Per-component LR | 未包含 | `meme_lr`, `llm_lr`, `projector_lr` in `ModelArguments`; `create_optimizer()` 分组实现 | 随机初始化组件和预训练组件需差异化 LR |
 | Frozen MemE 处理 | `gradient_checkpointing_enable()` 对所有组件 | Frozen MemE 在 `torch.no_grad()` 下运行，跳过 gradient checkpointing；输出 `detach().requires_grad_(True)` | 冻结模型无需 checkpointing |
 | Attention mask 构建 | `.ne(pad_token_id)` | 基于实际序列长度构建 | `pad_token == eos_token` 时 `.ne()` 会把真实 EOS 误标为 padding |
 | 文件 I/O 模式 | 未明确 | build_index.py 用 `rb`，dataset.py 也用 `rb` + `.decode()` | 字节偏移必须在同一模式下才正确 |
 | Worker 安全 | 仅提到 "forks independently" | `__del__` 清理 + `worker_init_fn` 重置句柄/seed + trainer `get_train_dataloader()` 注入 | Fork 后文件句柄实际共享，需显式重置 |
-| Curriculum 恢复 | 未涉及 | `CurriculumCallback.on_train_begin` 从 `global_step/max_steps` 恢复 | 防止 checkpoint 恢复后 curriculum 重置为 0 |
+| Curriculum 恢复 | 未涉及 | `CurriculumCallback.on_train_begin` 从 `state.epoch` 恢复 epoch | 防止 checkpoint 恢复后任务轮换重置 |
 | 显存估算 | 剩余 ~47GB | 修正为 ~40GB（加入 MemE/LLM 激活估算各 1.5/2.5GB） | 原计划遗漏 gradient checkpointing 下的激活开销 |
 
 ## Implementation Order

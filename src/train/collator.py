@@ -5,14 +5,13 @@ Handles two different padding strategies:
       so MEM tokens are always at the rightmost positions.
     - input_ids / labels: RIGHT-padded (standard causal LM convention).
 
-Also samples a single n_mem value per batch from a linear "many-to-few"
-curriculum distribution.
+n_mem is per-sample (sampled by dataset based on task type) and collected
+into a [B] tensor for the model to handle variable-length prefix.
 
 Task type (reconstruction vs continuation) is handled per-sample in the
 dataset via <AE> token in input_ids — no per-batch task_type needed.
 """
 
-import random
 from typing import Dict, List
 
 import torch
@@ -25,55 +24,18 @@ IGNORE_INDEX = -100
 class KawaiiDataCollator:
     """Collates samples with left-padded context and right-padded target."""
 
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizer,
-        num_mem_tokens_max: int = 128,
-    ):
+    def __init__(self, tokenizer: PreTrainedTokenizer):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
-        self.num_mem_tokens_max = num_mem_tokens_max
-
-        # Training progress (updated by CurriculumCallback)
-        self._training_progress = 0.0
-
-    def set_training_progress(self, progress: float):
-        self._training_progress = max(0.0, min(1.0, progress))
-
-    def _sample_n_mem(self) -> int:
-        """Sample n_mem from linear 'many-to-few' curriculum distribution.
-
-        Probability of each range changes linearly with progress p (0->1):
-            P(high:  64-128) = 0.7 - 0.6*p   // 70% -> 10%
-            P(mid:   16-64)  = 0.2 + 0.1*p   // 20% -> 30%
-            P(low:    2-16)  = 0.1 + 0.2*p   // 10% -> 30%
-            P(single:    1)  = 0.3*p          //  0% -> 30%
-        """
-        p = self._training_progress
-        N = self.num_mem_tokens_max  # 128
-
-        p_high = 0.7 - 0.6 * p    # P(64-N)
-        p_mid = 0.2 + 0.1 * p     # P(16-64)
-        p_low = 0.1 + 0.2 * p     # P(2-16)
-        # p_single = 0.3 * p       # P(1) — implicit remainder
-
-        r = random.random()
-        if r < p_high:
-            return random.randint(64, N)
-        elif r < p_high + p_mid:
-            return random.randint(16, 64)
-        elif r < p_high + p_mid + p_low:
-            return random.randint(2, 16)
-        else:
-            return 1
 
     def __call__(self, instances: List[Dict]) -> Dict[str, torch.Tensor]:
-        # Sample n_mem for the entire batch
-        n_mem = self._sample_n_mem()
-
         context_ids_list = [inst["context_ids"] for inst in instances]
         input_ids_list = [inst["input_ids"] for inst in instances]
         labels_list = [inst["labels"] for inst in instances]
+        n_mem_list = [inst["n_mem"] for inst in instances]
+
+        # --- Collect per-sample n_mem into a tensor ---
+        n_mem = torch.tensor(n_mem_list, dtype=torch.long)  # [B]
 
         # --- Left-pad context_ids (for MemE, padding_side='left') ---
         max_ctx_len = max(ids.shape[0] for ids in context_ids_list)

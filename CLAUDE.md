@@ -64,9 +64,9 @@ src/train/
 ├── arguments.py       # ModelArguments, DataArguments, TrainingArguments
 ├── build_index.py     # Standalone: scan formatted JSONL -> byte-offset index
 ├── model.py           # KawaiiLLMModel (MemE + Projector + LLM)
-├── dataset.py         # KawaiiDataset with byte-offset access + curriculum
-├── collator.py        # Left-pad context, right-pad target, sample n_mem
-├── trainer.py         # KawaiiTrainer + CurriculumCallback
+├── dataset.py         # KawaiiDataset with byte-offset access + deterministic task rotation
+├── collator.py        # Left-pad context, right-pad target, collect per-sample n_mem
+├── trainer.py         # KawaiiTrainer + CurriculumCallback (epoch tracking)
 └── train.py           # Entry point
 configs/
 ├── ds_zero2.json      # DeepSpeed ZeRO-2 config for 8x A800
@@ -91,7 +91,7 @@ bash configs/train_8xa800.sh
 Edit paths in `train_8xa800.sh` before running (`meme_model_name_or_path`, `llm_model_name_or_path`).
 
 ### Key Design Decisions
-- **Curriculum learning**: 3 phases control `n_mem` distribution (1->128) and task mix (reconstruction vs continuation).
+- **3-task deterministic rotation**: NTP (n_mem=0, no MemE), reconstruction (<AE>), continuation — each 1/3, cycled per sample every 3 epochs via `(idx + epoch + epoch//3) % 3`.
 - **Per-component LR**: projector+mem_embeddings ~1e-3, MemE ~1e-6, LLM ~1e-6.
 - **MemE frozen by default**: runs under `torch.no_grad()`, no gradient checkpointing needed.
 - **Context left-padded** (MemE padding_side='left'), target right-padded (standard causal LM).

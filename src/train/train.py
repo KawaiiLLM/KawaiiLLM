@@ -152,16 +152,14 @@ def train():
         tokenizer=tokenizer,
         context_max_length=data_args.context_max_length,
         target_max_length=data_args.target_max_length,
+        num_mem_tokens=model_args.num_mem_tokens,
     )
 
     # Build collator
-    collator = KawaiiDataCollator(
-        tokenizer=tokenizer,
-        num_mem_tokens_max=model_args.num_mem_tokens,
-    )
+    collator = KawaiiDataCollator(tokenizer=tokenizer)
 
-    # Build curriculum callback
-    curriculum_cb = CurriculumCallback(dataset=dataset, collator=collator)
+    # Build curriculum callback (updates dataset progress for task warmup)
+    curriculum_cb = CurriculumCallback(dataset=dataset)
 
     # Build trainer
     trainer = KawaiiTrainer(
