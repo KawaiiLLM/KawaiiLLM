@@ -6,8 +6,8 @@ set -euo pipefail
 
 deepspeed --num_gpus 8 src/train/train.py \
   --deepspeed configs/ds_zero2.json \
-  --meme_model_name_or_path /path/to/Qwen3-Embedding-4B \
-  --llm_model_name_or_path /path/to/Qwen3-8B-Base \
+  --meme_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-Embedding-4B-main/ \
+  --llm_model_name_or_path /lpai/inputs/models/qwen__qwen3-8b-base-25-04-28-1833/ \
   --data_dirs \
     data/novels/formatted \
     data/bilibili/formatted \
@@ -17,12 +17,12 @@ deepspeed --num_gpus 8 src/train/train.py \
     data/math/formatted \
     data/code/formatted \
   --index_path data/train_index.json \
-  --output_dir output/kawaii_v1 \
+  --output_dir /mnt/volumes/ss-sai-bd-ga/zhaoqixuan/output/kawaii_v1 \
   --num_mem_tokens 128 \
   --freeze_meme False \
-  --projector_lr 1e-3 \
-  --meme_lr 1e-6 \
-  --llm_lr 1e-6 \
+  --projector_lr 5e-4 \
+  --meme_lr 1e-5 \
+  --llm_lr 1e-5 \
   --bf16 True \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 8 \
@@ -37,5 +37,6 @@ deepspeed --num_gpus 8 src/train/train.py \
   --save_total_limit 3 \
   --logging_steps 10 \
   --dataloader_num_workers 4 \
-  --report_to wandb \
+  --logging_dir /lpai/output/tensorboard \
+  --report_to tensorboard \
   --run_name kawaii_v1
