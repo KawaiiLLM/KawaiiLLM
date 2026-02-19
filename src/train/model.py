@@ -176,6 +176,33 @@ class KawaiiLLMModel(nn.Module):
         self.meme.enable_input_require_grads()
         self.llm.enable_input_require_grads()
 
+    def _zero_loss_for_unused_params(self) -> torch.Tensor:
+        """Zero-valued loss keeping MemE/projector/mem_embeddings in the autograd graph.
+
+        In ZeRO-2, gradient ALLREDUCE must fire for every trainable parameter
+        on every rank. When a rank's micro-batch is pure NTP (max_n_mem=0),
+        MemE, projector, and mem_embeddings are absent from the computation
+        graph — their backward hooks never fire, other ranks wait forever,
+        and NCCL times out.
+
+        Fix: reference one element per parameter tensor with a zero multiplier.
+        This creates autograd nodes that produce zero gradients during backward,
+        triggering the hooks without affecting the real loss.
+        """
+        parts = []
+        if self.mem_embeddings.weight.requires_grad:
+            parts.append(self.mem_embeddings.weight.flatten()[0])
+        for p in self.projector.parameters():
+            if p.requires_grad:
+                parts.append(p.flatten()[0])
+        if not self._freeze_meme:
+            for p in self.meme.parameters():
+                if p.requires_grad:
+                    parts.append(p.flatten()[0])
+        if not parts:
+            return 0.0
+        return torch.stack(parts).sum() * 0.0
+
     def encode_context(
         self,
         context_ids: torch.LongTensor,
@@ -333,12 +360,18 @@ class KawaiiLLMModel(nn.Module):
             # --- Pure NTP batch: skip MemE entirely, no prefix ---
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
-            return self.llm(
+            outputs = self.llm(
                 inputs_embeds=target_embeds,
                 attention_mask=attention_mask,
                 labels=labels,
                 position_ids=position_ids,
             )
+            # Keep unused trainable params in the graph for ZeRO-2 gradient
+            # sync — prevents NCCL ALLREDUCE timeout when other ranks DO
+            # use MemE/projector in their (non-NTP) micro-batches.
+            if self.training:
+                outputs.loss = outputs.loss + self._zero_loss_for_unused_params()
+            return outputs
 
         # --- Mixed or full MemE batch ---
 
