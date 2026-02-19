@@ -176,33 +176,6 @@ class KawaiiLLMModel(nn.Module):
         self.meme.enable_input_require_grads()
         self.llm.enable_input_require_grads()
 
-    def _zero_loss_for_unused_params(self) -> torch.Tensor:
-        """Zero-valued loss keeping MemE/projector/mem_embeddings in the autograd graph.
-
-        In ZeRO-2, gradient ALLREDUCE must fire for every trainable parameter
-        on every rank. When a rank's micro-batch is pure NTP (max_n_mem=0),
-        MemE, projector, and mem_embeddings are absent from the computation
-        graph — their backward hooks never fire, other ranks wait forever,
-        and NCCL times out.
-
-        Fix: reference one element per parameter tensor with a zero multiplier.
-        This creates autograd nodes that produce zero gradients during backward,
-        triggering the hooks without affecting the real loss.
-        """
-        parts = []
-        if self.mem_embeddings.weight.requires_grad:
-            parts.append(self.mem_embeddings.weight.flatten()[0])
-        for p in self.projector.parameters():
-            if p.requires_grad:
-                parts.append(p.flatten()[0])
-        if not self._freeze_meme:
-            for p in self.meme.parameters():
-                if p.requires_grad:
-                    parts.append(p.flatten()[0])
-        if not parts:
-            return 0.0
-        return torch.stack(parts).sum() * 0.0
-
     def encode_context(
         self,
         context_ids: torch.LongTensor,
@@ -357,21 +330,54 @@ class KawaiiLLMModel(nn.Module):
         target_embeds = llm_embed(input_ids)  # [B, T, llm_hidden]
 
         if max_n_mem == 0:
-            # --- Pure NTP batch: skip MemE entirely, no prefix ---
+            # --- Pure NTP batch ---
+            if self.training:
+                # ZeRO-2 requires gradient ALLREDUCE to fire in the same
+                # bucket order on every rank.  Non-NTP ranks backward as
+                # LLM → projector → MemE (sequential chain).  If we just
+                # run the LLM here, MemE/projector hooks never fire, or
+                # fire via an independent branch with a different order,
+                # causing NCCL deadlock.
+                #
+                # Fix: run a minimal MemE + projector and embed the result
+                # as a masked prefix in the LLM input.  Backward then
+                # naturally flows LLM → prefix → projector → MemE —
+                # matching the non-NTP path order exactly.
+                dummy_mem = self.encode_context(
+                    context_ids[:1], context_attention_mask[:1], 1,
+                )
+                dummy_proj = self.projector(dummy_mem)  # [1, 1, llm_hidden]
+
+                # 1-token masked prefix, connected to dummy_proj for grad flow
+                prefix_embeds = target_embeds.new_zeros(B, 1, llm_hidden)
+                prefix_embeds = prefix_embeds + (dummy_proj.sum() * 0.0)
+                prefix_mask = attention_mask.new_zeros(B, 1)
+
+                combined_embeds = torch.cat([prefix_embeds, target_embeds], dim=1)
+                combined_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+                prefix_labels = torch.full(
+                    (B, 1), IGNORE_INDEX, dtype=labels.dtype, device=device,
+                )
+                combined_labels = torch.cat([prefix_labels, labels], dim=1)
+                position_ids = combined_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(combined_mask == 0, 0)
+
+                return self.llm(
+                    inputs_embeds=combined_embeds,
+                    attention_mask=combined_mask,
+                    labels=combined_labels,
+                    position_ids=position_ids,
+                )
+
+            # Eval: no gradient sync needed, skip MemE entirely
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
-            outputs = self.llm(
+            return self.llm(
                 inputs_embeds=target_embeds,
                 attention_mask=attention_mask,
                 labels=labels,
                 position_ids=position_ids,
             )
-            # Keep unused trainable params in the graph for ZeRO-2 gradient
-            # sync — prevents NCCL ALLREDUCE timeout when other ranks DO
-            # use MemE/projector in their (non-NTP) micro-batches.
-            if self.training:
-                outputs.loss = outputs.loss + self._zero_loss_for_unused_params()
-            return outputs
 
         # --- Mixed or full MemE batch ---
 
