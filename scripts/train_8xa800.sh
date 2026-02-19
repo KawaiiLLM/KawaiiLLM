@@ -36,7 +36,7 @@ deepspeed --num_gpus 8 --module src.train.train \
   --save_steps 2000 \
   --save_total_limit 3 \
   --logging_steps 10 \
-  --dataloader_num_workers 4 \
+  --dataloader_num_workers 32 \
   --logging_dir /lpai/output/tensorboard \
   --report_to tensorboard \
   --run_name kawaii_v1
