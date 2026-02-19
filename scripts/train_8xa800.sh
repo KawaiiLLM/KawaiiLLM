@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-deepspeed --num_gpus 8 -m src.train.train \
+deepspeed --num_gpus 8 --module src.train.train \
   --deepspeed configs/ds_zero2.json \
   --meme_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-Embedding-4B-main/ \
   --llm_model_name_or_path /lpai/inputs/models/qwen__qwen3-8b-base-25-04-28-1833/ \
