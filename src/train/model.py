@@ -252,6 +252,17 @@ class KawaiiLLMModel(nn.Module):
             [context_attention_mask, extra_mask], dim=1
         )  # [B, L+1+n_mem+1]
 
+        # Prevent NaN from all-masked causal attention at left-padded positions.
+        # Position 0 with mask=0 has NO valid attention targets under causal
+        # attention (can only attend to itself, blocked by mask=0).  This makes
+        # softmax output NaN.  Forward is unaffected (Q outputs never use
+        # position 0), but backward computes `output * (grad - ...)` where
+        # `output` is NaN → NaN gradient for ALL shared MemE attention params
+        # (IEEE 754: 0 * NaN = NaN).  Setting mask[:, 0] = 1 lets position 0
+        # self-attend; subsequent padded positions then attend to position 0,
+        # preventing any all-masked rows.
+        extended_mask[:, 0] = 1
+
         # Build position_ids from attention mask (handles left-padded context)
         position_ids = extended_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(extended_mask == 0, 0)
