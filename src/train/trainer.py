@@ -93,6 +93,36 @@ class KawaiiTrainer(Trainer):
         )
 
         loss = outputs.loss
+
+        # --- Debug logging for first 3 optimizer steps ---
+        if self.state.global_step < 3:
+            import torch
+            labels = inputs["labels"]
+            valid = (labels != -100).sum().item()
+            total = labels.numel()
+            logits = outputs.logits
+            logger.info(
+                "DEBUG step=%d | loss=%.4f | loss_dtype=%s | "
+                "logits shape=%s dtype=%s min=%.4f max=%.4f "
+                "has_nan=%s has_inf=%s | "
+                "labels valid=%d/%d | n_mem=%s | "
+                "input_ids shape=%s attn_mask sum=%s",
+                self.state.global_step,
+                loss.item(),
+                loss.dtype,
+                logits.shape,
+                logits.dtype,
+                logits.float().min().item(),
+                logits.float().max().item(),
+                torch.isnan(logits).any().item(),
+                torch.isinf(logits).any().item(),
+                valid,
+                total,
+                n_mem.tolist(),
+                inputs["input_ids"].shape,
+                inputs["attention_mask"].sum(dim=1).tolist(),
+            )
+
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
