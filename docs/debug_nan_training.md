@@ -258,162 +258,90 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 
 ---
 
-### 阶段 10 — NaN 梯度安全网对 inf 盲视（已修复）
+### 阶段 10–13 — 错误假说（已被阶段 14 推翻）
 
-**输入**：应用残差嵌入修复（阶段 9，commit `fe3004d`）后的训练日志
+> **注意**：阶段 10–13 中的 bf16 溢出假说、`register_hook` 安全网、`communication_data_type=fp32` 等均基于错误推断。阶段 14 的控制实验证明：NaN 的唯一根因是 DeepSpeed 0.16.4 的 IPG 双缓冲区竞争 bug（[#7188](https://github.com/deepspeedai/DeepSpeed/issues/7188)），与 bf16 精度无关。这些阶段的诊断代码和中间修复已全部移除。
 
-**观察**：
-- Step 0 forward 完全干净（loss=2.5917，logits 有限）
-- NaN gradient guard 在 step 0 期间无任何 `occurrence` 日志 → 梯度不是 NaN
-- 中间张量诊断 hook 无 NaN、无 inf → 输出梯度有限
-- 但 `grad_norm: nan` 在 step 0 → 梯度计算和 optimizer 之间出了问题
-- `NaNDetectorCallback`：step 0 后所有 404 个参数权重均为 NaN
-- `learning_rate: 0.0`（warmup）→ 但 `0.0 * NaN = NaN`（IEEE 754）
+**已撤销的无效修复**：
+- `register_nan_gradient_hooks()` / `get_and_reset_explosion_stats()` — 梯度本身没有 inf，hook 从未触发
+- `communication_data_type: fp32` — allreduce 不存在溢出
+- `grad.nan_to_num_()` 原地修改 — 不需要
 
-**根因分析：inf 盲视导致的级联**
-
-NaN gradient guard（`register_nan_gradient_hooks`）只检查 `torch.isnan()`，遗漏了 `torch.isinf()`。完整级联链：
-
-```
-bf16 参数梯度 matmul 溢出 → inf（不是 NaN）
-→ guard 只检查 isnan → inf 通过
-→ DeepSpeed 梯度裁剪：norm = inf, scale = max_norm / inf = 0
-→ 裁剪后梯度：inf * 0 = NaN（IEEE 754）
-→ optimizer：w = w - lr * NaN = w - NaN = NaN（0 * NaN = NaN, IEEE 754）
-→ 所有权重变为 NaN → 训练崩溃
-```
-
-**关键解释**：为什么中间张量 hook 没有捕获 inf？
-
-中间张量 hook（`projected.register_hook`、`llm_input.register_hook` 等）监控的是**输出梯度**（`d_loss/d_output`）。参数梯度是通过 `activation^T @ output_gradient` matmul 计算的，这个矩阵乘法可以在 bf16 中独立溢出为 inf，即使输入的两个操作数都是有限的。
-
-**修复**：
-
-1. `src/train/model.py`：`register_nan_gradient_hooks()` 中 `_hook` 函数同时检查 `torch.isnan()` 和 `torch.isinf()`
-2. `src/train/trainer.py`：`NaNDetectorCallback.on_step_end` 同时检查权重中的 NaN 和 inf
+**保留的有效修复**：
+- `overlap_comm: true, contiguous_gradients: false` — 阶段 14 确定的最终方案
 
 ---
 
-### 阶段 11 — 根因确认：DeepSpeed bf16 allreduce 溢出（已修复）
+### 阶段 14 — 最终根因：DeepSpeed IPG 双缓冲区 CUDA 流竞争（已修复）
 
-**输入**：Phase 10 修复后（commit `9602b52`），8 卡训练日志仍然崩溃——所有 404 个参数在 step 0 后变为 NaN/inf，但梯度 hook 无任何警告。
+**背景**：阶段 10–13 的 bf16 溢出假说一直无法自洽——单卡训练零 NaN，hook 从未真正捕获到 inf 梯度。通过控制实验彻底推翻旧假说，定位到真正根因。
 
-**关键线索整理**：
+**控制实验（0.6B + 4B，8×A800，context_max_length=4096）**：
 
-| 观察 | 含义 |
-|---|---|
-| Step 0 forward 干净（loss=2.5917，logits 有限） | 前向无问题 |
-| 梯度 hook（`register_nan_gradient_hooks`）**无任何警告** | 参数梯度在 hook 触发时是**有限值** |
-| step 0 后**所有 404 个参数**变为 NaN/inf | 损坏发生在 hook 触发**之后** |
-| 同样的日志在**全部 8 个 rank 上重复** | 损坏对称，指向 **allreduce** |
+| 配置 | overlap_comm | contiguous_gradients | 结果 |
+|------|:---:|:---:|------|
+| 单 GPU（无 DeepSpeed） | — | — | 正常，零 NaN |
+| 8 GPU，两者都关 | false | false | 正常 |
+| 8 GPU，仅 overlap | true | false | **正常** |
+| 8 GPU，仅 contiguous | false | true | **正常** |
+| 8 GPU，两者都开 | true | true | **Step 1 即 NaN，模型死亡** |
 
-**诊断实验**：单卡，去掉 DeepSpeed（`scripts/train_debug_no_ds.sh`）
+**结论**：**只有** `overlap_comm: true` + `contiguous_gradients: true` 同时启用才触发 NaN。任一单独启用均正常。
 
-```
-All parameters clean after step 0
-{'loss': 2.603, 'grad_norm': 32.793, 'learning_rate': 0.0, 'epoch': 0.0}
-{'loss': 2.426, 'grad_norm': 11.402, 'learning_rate': 1e-05, ...}
-{'loss': 2.935, 'grad_norm': 24.097, ...}
-...（5 步全部正常）
-```
+**根因：DeepSpeed Issue [#7188](https://github.com/deepspeedai/DeepSpeed/issues/7188)**
 
-**结论**：单卡（无 allreduce）训练完全正常 → 根因在 DeepSpeed 的 8 卡 allreduce 阶段。
-
-**根因：DeepSpeed ZeRO-2 bf16 allreduce 中间求和溢出**
+DeepSpeed ZeRO-2 在 `overlap_comm + contiguous_gradients` 模式下使用 ping-pong 双缓冲区：
 
 ```
-1. 各卡 backward：参数梯度有限 → hook 触发，passthrough（无警告）
-2. DeepSpeed AllReduce（NCCL）：8 × large_grad 求和
-   → 中间和可能超过 bf16 上限（65504）→ 溢出为 inf
-3. DeepSpeed 梯度裁剪：
-   global_norm = sqrt(sum(inf^2)) = inf
-   scale = max_norm / inf = 1.0 / inf = 0.0
-   clipped_grad = inf × 0.0 = NaN  ← IEEE 754
-4. Warmup 阶段 lr ≈ 0：
-   w = w - 0 × NaN = w - NaN = NaN  ← 0 × NaN = NaN（IEEE 754）
-5. 全部 404 个参数 → NaN
+compute stream:  backward → copy grad → buffer[0]
+                                          ↓ trigger reduce
+reduction stream:              allreduce(buffer[0])  ← 异步
+compute stream:  buffer.clear() → index 重置为 0 ← BUG!
+compute stream:  copy next grad → buffer[0]        ← 覆盖！
+                                                      ↑
+                              reduction stream 还在读 buffer[0] → 脏数据 → NaN
 ```
 
-**为什么单卡不溢出**：单卡 grad_norm ≈ 32.8，说明个别参数梯度元素可达数百量级（embedding 的稀疏梯度行，同一 token 多次出现时累积）。8 卡 allreduce 对这些元素求和后，可能超过 bf16 上限（65504 / 8 ≈ 8188 per GPU 即在溢出边界）。
+`bucket.clear()`（PR [#6993](https://github.com/deepspeedai/DeepSpeed/pull/6993) 引入的回归）在每次清理时将 buffer index 强制重置为 0，破坏了 ping-pong 交替机制。compute stream 写入 buffer[0] 的同时 reduction stream 还在读取 buffer[0] 做 allreduce——经典的 CUDA 流数据竞争。
 
-**修复**：`configs/ds_zero2.json` 增加一行：
+**为什么两个选项单独启用不会出问题**：
+- 仅 `overlap_comm: true`：异步 allreduce 在独立 stream 上运行，但梯度直接用 `param.grad`（无 contiguous buffer），没有可竞争的共享缓冲区
+- 仅 `contiguous_gradients: true`：梯度复制到 contiguous buffer，但 allreduce 在 compute stream 上同步执行，写完再读，无竞争
+
+**DeepSpeed 版本验证**：
+
+| 版本 | overlap + contiguous | 状态 |
+|------|:---:|------|
+| 0.16.4 | NaN | 包含 bug（PR #6993），不包含修复 |
+| 0.18.6 | NaN | PR #7805 未完全修复此场景 |
+
+**最终修复**：
 
 ```json
-"communication_data_type": "fp32"
+{
+  "zero_optimization": {
+    "stage": 2,
+    "overlap_comm": true,
+    "contiguous_gradients": false
+  }
+}
 ```
 
-强制 NCCL allreduce 在 fp32 下进行，防止中间求和溢出，结果再转回 bf16 存入 `param.grad`。
+保留 `overlap_comm: true` 获得通信重叠性能，禁用 `contiguous_gradients` 消除双缓冲区竞争。
 
-**提交**：`b50e1d5` — `fix(deepspeed): force fp32 gradient allreduce to prevent bf16 overflow`
+**已移除的无效修复**：
+- `register_nan_gradient_hooks()` — 梯度本身无 inf/NaN，hook 计数始终为 0
+- `communication_data_type: fp32` — allreduce 不存在 bf16 溢出
+- `grad.nan_to_num_()` in-place — 不需要
 
----
+**相关 DeepSpeed Issue**：
 
-### 阶段 12 — register_hook 返回值被 DeepSpeed ZeRO-2 绕过
-
-**问题**：Phase 10 的 inf 检测 + Phase 11 的 `communication_data_type=fp32` 应用后，重新运行 8 卡训练仍然崩溃。
-
-**新证据**：
-- 梯度 hook **在各卡上触发**：`layers.10/15/33.mlp.down_proj.weight` 报告 `inf=True`
-- hook 声称 "zeroing" 但 NaNDetectorCallback 显示 step 0 后全部 404 参数 NaN/inf
-- inf 来源是**单卡 backward**（非 allreduce）——长序列（2000-4000 tokens）导致 `activation^T @ grad_output` 在 bf16 下溢出
-
-**根因**：hook 返回 `torch.zeros_like(grad)`（**新张量**），但 DeepSpeed ZeRO-2 通过自己的机制捕获梯度：
-1. `contiguous_gradients: true`——预分配连续缓冲区，backward 时梯度数据直接拷贝进去，hook 返回的新张量不影响缓冲区
-2. `overlap_comm: true`——异步启动 allreduce，可能在 hook 执行完毕前就读取了原始梯度
-3. Accelerate 的 `DeepSpeedEngineWrapper.backward()` 在最后一个微批次中原子地调用 `engine.backward()` + `engine.step()`，Trainer 层面无法在两者之间插入清理
-
-**级联效应**：当 `down_proj` backward 产生 inf 激活梯度时，该 inf 回传到所有更早的层，导致全部参数梯度变 inf。hook 虽然逐个清零，但 DeepSpeed 的缓冲区已经持有原始 inf 值。
-
-**修复（3 处变更）**：
-
-1. `configs/ds_zero2.json`：
-   - `overlap_comm: false`——禁用异步通信，确保 hook 在 allreduce 前完成
-   - `contiguous_gradients: false`——强制使用 `param.grad` 而非预分配缓冲区
-
-2. `src/train/model.py` `_hook()`：
-   - `torch.zeros_like(grad)` → `grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0); return grad`
-   - 原地修改确保任何持有该张量引用的代码（包括 DeepSpeed）看到清理后的值
-
-3. 性能影响：无通信重叠 + 非连续梯度布局 → 略慢，但保证正确性
-
-**验证结果（Phase 12 已确认有效）**：
-
-```
-All parameters clean after step 0  (×6，各 GPU 独立上报)
-{'loss': 36.8349, 'grad_norm': 397.7725, 'learning_rate': 0.0, 'epoch': 0.0}
-{'loss': 37.1849, 'grad_norm': 34.9922, 'learning_rate': 1e-05, 'epoch': 0.0}
-{'loss': 35.2196, 'grad_norm': 13.4882, 'learning_rate': 9.989e-06, ...}
-{'loss': 36.4791, 'grad_norm': 9.7979, ...}
-...（grad_norm 持续收敛，训练稳定）
-```
-
-grad_norm 从 397 迅速降至个位数说明模型权重完好，梯度正常流动。loss ≈ 36 对应每步约 16 个梯度累积微批次的总和（36 / 16 ≈ 2.25/sample，合理）。
-
----
-
-### 阶段 13 — 日志清理 + 爆炸检测重构
-
-**背景**：Phase 12 验证通过后，清理遗留的调试代码，并将爆炸检测从"逐条警告"改为"每步汇总"。
-
-**删除的冗余日志**：
-
-1. `compute_loss` 中的 DEBUG 块——每个 micro-batch 都打印 logits 统计信息，训练稳定后无意义
-2. `model.py forward()` 中的两处内联梯度 hook：
-   - NTP 路径：`GRAD_NaN fwd=N NTP_dummy_proj / NTP_combined_embeds`
-   - 非 NTP 路径：`GRAD_NaN fwd=N projected / mem_hidden / llm_input / target_embeds`
-3. `_grad_hook_count` 计数器（驱动上述内联 hook 的开关）
-
-**新增爆炸检测设计**：
-
-`register_nan_gradient_hooks()` 改为将每次爆炸计入 `self._explosion_counts[param_name]`，不再逐条打印。`NaNDetectorCallback.on_step_end` 每步调用 `get_and_reset_explosion_stats()` 汇总并上报：
-
-```
-Step 5: 112 gradient explosion(s) zeroed — llm:108, projector:4
-```
-
-无爆炸时静默，有爆炸时一行 WARNING，按组件汇总总数。只在 local rank 0 打印，避免 8 卡重复。
-
-`NaNDetectorCallback` 保留 step 0 后的参数 NaN 检查（作为安全网，验证修复是否失效）。
+| Issue | 描述 |
+|-------|------|
+| [#7188](https://github.com/deepspeedai/DeepSpeed/issues/7188) | overlap_comm + contiguous_gradients → NaN（本 bug） |
+| [#5545](https://github.com/microsoft/DeepSpeed/issues/5545) | 同类 CUDA 流数据竞争（字节跳动报告） |
+| [PR #5606](https://github.com/microsoft/DeepSpeed/pull/5606) | 双向 stream 同步修复 |
+| [PR #7805](https://github.com/deepspeedai/DeepSpeed/pull/7805) | 综合修复（但 0.18.6 仍未彻底解决） |
 
 ---
 
@@ -422,13 +350,10 @@ Step 5: 112 gradient explosion(s) zeroed — llm:108, projector:4
 | 文件 | 行为 |
 |------|------|
 | `src/train/model.py:265` | `extended_mask[:, 0] = 1`：防止 MemE 左填充 position 0 的 softmax NaN |
-| `src/train/model.py:199` | `register_nan_gradient_hooks()`：参数级梯度爆炸安全网，计数到 `_explosion_counts` |
-| `src/train/model.py:236` | `get_and_reset_explosion_stats()`：查询并重置爆炸计数 |
 | `src/train/model.py:536` | 残差嵌入：`projected += pad_embed_vec`，防止 RMSNorm 梯度爆炸 |
 | `src/train/model.py:574` | `prefix_attn[:, 0] = 1`：LLM 前缀左填充 NaN 防护 |
-| `src/train/trainer.py:19` | `NaNDetectorCallback`：每步爆炸汇总 + step 0 后参数 NaN 检查 |
-| `src/train/train.py:140` | `model.register_nan_gradient_hooks()` 调用 |
-| `configs/ds_zero2.json` | `overlap_comm=false, contiguous_gradients=false, communication_data_type=fp32` |
+| `src/train/trainer.py:19` | `NaNDetectorCallback`：step 0 后参数 NaN/inf 检查 |
+| `configs/ds_zero2.json` | `overlap_comm=true, contiguous_gradients=false`：规避 DeepSpeed IPG 竞争 |
 
 ---
 
@@ -437,14 +362,17 @@ Step 5: 112 gradient explosion(s) zeroed — llm:108, projector:4
 | Commit | 说明 | 结果 |
 |--------|------|------|
 | 8cc444a | 修复 encode_context 中 extended_mask position 0 | step 1 仍 NaN，假设 1 排除 |
-| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除，诊断代码就位 |
+| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除 |
 | 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
 | 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
 | 6f24817 | 移除 `attn_implementation="eager"` | 消除 eager attention OOM |
 | c7892e6 | 根因修复：零嵌入 → pad embedding | NTP path 干净，n_mem>0 仍有 GRAD_NaN |
 | fe3004d | 残差嵌入：`projected += pad_embed_vec` | 梯度 hook 不再触发，但 8 卡仍 NaN |
-| 9602b52 | 梯度安全网扩展：同时检查 isnan + isinf | 诊断工具就绪 |
+| 9602b52 | ~~梯度安全网扩展~~ | 已撤销（阶段 14 证明不需要） |
 | f940fd9 | 单卡无 DS 诊断脚本 | 单卡正常，确认 allreduce 是根因 |
-| b50e1d5 | `communication_data_type=fp32` | allreduce 溢出修复，但 hook bypass 问题仍存在 |
-| 6525f09 | 文档：Phase 11 allreduce 溢出根因 | — |
-| 9f143be | Phase 12：in-place nan_to_num + DS config 修复 hook bypass | **8 卡验证通过，训练稳定** |
+| b50e1d5 | ~~`communication_data_type=fp32`~~ | 已撤销（阶段 14 证明不需要） |
+| 9f143be | ~~Phase 12: in-place nan_to_num + DS config~~ | 已撤销（阶段 14 确认只需禁用 contiguous_gradients） |
+| c5a71d5 | ~~Phase 13: 日志清理 + 爆炸检测~~ | 已撤销 |
+| 16a8fab | 撤销 register_hook + 恢复 overlap/contiguous | 用于控制实验 |
+| e32749e | overlap_comm=false + contiguous_gradients=false，移除 fp32 allreduce | 保守方案验证通过 |
+| **最终** | `overlap_comm=true, contiguous_gradients=false` | **最终方案：保留通信重叠，禁用双缓冲区** |
