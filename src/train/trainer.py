@@ -17,29 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class NaNDetectorCallback(TrainerCallback):
-    """Report gradient explosions per step and detect NaN parameters after step 0."""
+    """Detect NaN/inf parameters after step 0."""
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if model is None:
             return
         m = model.module if hasattr(model, "module") else model
-
-        # Collect explosion stats on all ranks (to reset counters), log on rank 0 only
-        if hasattr(m, "get_and_reset_explosion_stats"):
-            stats = m.get_and_reset_explosion_stats()
-            if args.local_process_index == 0:
-                total = sum(stats.values())
-                by_comp: Dict[str, int] = {}
-                for name, count in stats.items():
-                    comp = name.split(".")[0]
-                    by_comp[comp] = by_comp.get(comp, 0) + count
-                logger.info(
-                    "Step %d grad explosions: %d zeroed — %s",
-                    state.global_step,
-                    total,
-                    ", ".join(f"{c}:{n}" for c, n in sorted(by_comp.items()))
-                    if by_comp else "none",
-                )
 
         # After step 0: sanity-check that no parameters became NaN/inf
         if state.global_step == 1:

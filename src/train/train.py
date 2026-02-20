@@ -135,10 +135,6 @@ def train():
         )
         model.enable_input_require_grads()
 
-    # Register NaN gradient guard — replaces NaN gradients with zero to
-    # prevent a single corrupted micro-batch from poisoning training.
-    model.register_nan_gradient_hooks()
-
     # Log parameter counts
     total, trainable = count_parameters(model)
     logger.info(

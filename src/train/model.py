@@ -119,15 +119,11 @@ class KawaiiLLMModel(nn.Module):
 
         self._freeze_meme = freeze_meme
         self.num_mem_tokens = num_mem_tokens
-        self._explosion_counts: Dict[str, int] = {}  # per-step gradient explosion counts
-
         # Special token IDs (set by set_special_token_ids after tokenizer registration)
         self._mem_token_id: Optional[int] = None
         self._mem_end_token_id: Optional[int] = None
         self._ae_token_id: Optional[int] = None
         self._pad_token_id: Optional[int] = None
-
-        self._nan_hook_handles = []  # for NaN gradient guard hooks
 
         logger.info(
             "KawaiiLLM initialized: meme_hidden=%d, llm_hidden=%d, "
@@ -195,50 +191,6 @@ class KawaiiLLMModel(nn.Module):
         """Required when gradient checkpointing is used with frozen params."""
         self.meme.enable_input_require_grads()
         self.llm.enable_input_require_grads()
-
-    def register_nan_gradient_hooks(self):
-        """Register backward hooks that replace NaN/inf gradients with zero.
-
-        Prevents a single corrupted micro-batch from poisoning the entire
-        gradient accumulation (NaN + finite = NaN in IEEE 754).  Also catches
-        inf gradients: bf16 matmul overflow produces inf, which DeepSpeed
-        gradient clipping turns into NaN via inf * (max_norm / inf) = inf * 0
-        = NaN (IEEE 754).
-
-        Uses in-place nan_to_num_() instead of returning a new tensor because
-        DeepSpeed ZeRO-2 may capture the gradient tensor into its own buffer.
-        In-place modification ensures any reference to the tensor sees sanitized
-        values.  Requires overlap_comm=false and contiguous_gradients=false in
-        the DeepSpeed config to prevent async/buffer bypass.
-
-        Explosion counts are accumulated in self._explosion_counts per parameter
-        and can be queried and reset with get_and_reset_explosion_stats().
-        """
-        def _make_hook(param_name):
-            def _hook(grad):
-                if torch.isnan(grad).any() or torch.isinf(grad).any():
-                    self._explosion_counts[param_name] = (
-                        self._explosion_counts.get(param_name, 0) + 1
-                    )
-                    grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
-                return grad
-            return _hook
-
-        count = 0
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            handle = param.register_hook(_make_hook(name))
-            self._nan_hook_handles.append(handle)
-            count += 1
-
-        logger.info("Registered NaN gradient guard on %d parameters", count)
-
-    def get_and_reset_explosion_stats(self) -> Dict[str, int]:
-        """Return per-parameter explosion counts since last call and reset."""
-        stats = dict(self._explosion_counts)
-        self._explosion_counts.clear()
-        return stats
 
     def encode_context(
         self,
