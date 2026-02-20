@@ -327,6 +327,42 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 
 ---
 
+### 阶段 10 — NaN 梯度安全网对 inf 盲视（已修复）
+
+**输入**：应用残差嵌入修复（阶段 9，commit `fe3004d`）后的训练日志
+
+**观察**：
+- Step 0 forward 完全干净（loss=2.5917，logits 有限）
+- NaN gradient guard 在 step 0 期间无任何 `occurrence` 日志 → 梯度不是 NaN
+- 中间张量诊断 hook 无 NaN、无 inf → 输出梯度有限
+- 但 `grad_norm: nan` 在 step 0 → 梯度计算和 optimizer 之间出了问题
+- `NaNDetectorCallback`：step 0 后所有 404 个参数权重均为 NaN
+- `learning_rate: 0.0`（warmup）→ 但 `0.0 * NaN = NaN`（IEEE 754）
+
+**根因分析：inf 盲视导致的级联**
+
+NaN gradient guard（`register_nan_gradient_hooks`）只检查 `torch.isnan()`，遗漏了 `torch.isinf()`。完整级联链：
+
+```
+bf16 参数梯度 matmul 溢出 → inf（不是 NaN）
+→ guard 只检查 isnan → inf 通过
+→ DeepSpeed 梯度裁剪：norm = inf, scale = max_norm / inf = 0
+→ 裁剪后梯度：inf * 0 = NaN（IEEE 754）
+→ optimizer：w = w - lr * NaN = w - NaN = NaN（0 * NaN = NaN, IEEE 754）
+→ 所有权重变为 NaN → 训练崩溃
+```
+
+**关键解释**：为什么中间张量 hook 没有捕获 inf？
+
+中间张量 hook（`projected.register_hook`、`llm_input.register_hook` 等）监控的是**输出梯度**（`d_loss/d_output`）。参数梯度是通过 `activation^T @ output_gradient` matmul 计算的，这个矩阵乘法可以在 bf16 中独立溢出为 inf，即使输入的两个操作数都是有限的。
+
+**修复**：
+
+1. `src/train/model.py`：`register_nan_gradient_hooks()` 中 `_hook` 函数同时检查 `torch.isnan()` 和 `torch.isinf()`
+2. `src/train/trainer.py`：`NaNDetectorCallback.on_step_end` 同时检查权重中的 NaN 和 inf
+
+---
+
 ## 后续清理（训练稳定后）
 
 确认 step 1 loss 正常、grad_norm 有限后，可以删除以下诊断代码：

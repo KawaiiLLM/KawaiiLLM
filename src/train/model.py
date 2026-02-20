@@ -197,27 +197,33 @@ class KawaiiLLMModel(nn.Module):
         self.llm.enable_input_require_grads()
 
     def register_nan_gradient_hooks(self):
-        """Register backward hooks that replace NaN gradients with zero.
+        """Register backward hooks that replace NaN/inf gradients with zero.
 
         Prevents a single corrupted micro-batch from poisoning the entire
-        gradient accumulation (NaN + finite = NaN in IEEE 754).  Hooks fire
-        during backward for each micro-batch, BEFORE gradient accumulation.
+        gradient accumulation (NaN + finite = NaN in IEEE 754).  Also catches
+        inf gradients: bf16 matmul overflow produces inf, which DeepSpeed
+        gradient clipping turns into NaN via inf * (max_norm / inf) = inf * 0
+        = NaN (IEEE 754).  Hooks fire during backward for each micro-batch,
+        BEFORE gradient accumulation.
 
         Also logs the first few occurrences per parameter for diagnosis.
         """
-        nan_counts = {}
+        bad_counts = {}
 
         def _make_hook(param_name):
-            nan_counts[param_name] = 0
+            bad_counts[param_name] = 0
 
             def _hook(grad):
-                if not torch.isnan(grad).any():
+                has_nan = torch.isnan(grad).any()
+                has_inf = torch.isinf(grad).any()
+                if not (has_nan or has_inf):
                     return grad
-                nan_counts[param_name] += 1
-                if nan_counts[param_name] <= 3:
+                bad_counts[param_name] += 1
+                if bad_counts[param_name] <= 3:
                     logger.warning(
-                        "NaN gradient in %s (occurrence %d), zeroing",
-                        param_name, nan_counts[param_name],
+                        "Bad gradient in %s (occurrence %d): nan=%s inf=%s, zeroing",
+                        param_name, bad_counts[param_name],
+                        has_nan.item(), has_inf.item(),
                     )
                 return torch.zeros_like(grad)
 
