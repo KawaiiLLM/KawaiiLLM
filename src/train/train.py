@@ -122,9 +122,14 @@ def train():
     }
     model.set_special_token_ids(special_token_ids)
 
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing.
+    # use_reentrant=False avoids the known Flash Attention + reentrant GC
+    # incompatibility where GC re-runs the forward and Flash Attention's saved
+    # log_sum_exp tensors get recomputed, producing NaN in the backward pass.
     if training_args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
         model.enable_input_require_grads()
 
     # Log parameter counts
