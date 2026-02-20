@@ -380,16 +380,7 @@ class KawaiiLLMModel(nn.Module):
                 # softmax over all-masked keys).  We also mask labels[0] so
                 # no loss is computed at the prefix-to-target boundary where
                 # logits are based on the dummy input.
-                #
-                # Use pad token embedding instead of zeros.  Zero embeddings
-                # cause RMSNorm backward to amplify gradients by 1/sqrt(eps)
-                # ≈ 1000× per layer.  After ~12 layers this overflows to inf
-                # in bfloat16; inf × V(=0) = NaN in attention backward,
-                # poisoning all positions' gradients through softmax.
-                pad_id = torch.full(
-                    (1, 1), self._pad_token_id, device=device, dtype=torch.long,
-                )
-                prefix_embeds = llm_embed(pad_id).detach().expand(B, -1, -1)
+                prefix_embeds = target_embeds.new_zeros(B, 1, target_embeds.size(-1))
                 prefix_embeds = prefix_embeds + (dummy_proj.sum() * 0.0)
                 prefix_mask = attention_mask.new_ones(B, 1)
 
@@ -442,25 +433,7 @@ class KawaiiLLMModel(nn.Module):
             projected = projected_sub.new_zeros(B, max_n_mem, projected_sub.size(-1))
             projected[mem_idx] = projected_sub
 
-        # Pad token embedding — used in two places below:
-        # 1. Residual base for projected tokens (numerical stability)
-        # 2. Fill for left-padded prefix positions
-        pad_id = torch.full(
-            (1,), self._pad_token_id, device=device, dtype=torch.long,
-        )
-        pad_embed_vec = llm_embed(pad_id).detach().squeeze(0)  # [llm_hidden]
-
-        # Residual embedding: add detached pad embedding as constant base.
-        # The projector output starts near-zero (std ≈ 0.003 from init).
-        # When this enters the LLM, each RMSNorm layer amplifies backward
-        # gradients by ~1/RMS ≈ 333× (vs 50× for normal embeddings at
-        # RMS ≈ 0.02).  For specific data patterns this compounds enough
-        # to produce NaN in bfloat16.  Adding a constant base ensures the
-        # prefix tokens have normal magnitude, bounding the amplification.
-        # The projector output acts as a learned perturbation on top.
-        projected = projected + pad_embed_vec.unsqueeze(0).unsqueeze(0)
-
-        # 2. Build per-sample left-padded prefix
+        # Build per-sample left-padded prefix
         mem_start_id = torch.tensor(
             [self._mem_token_id], device=device, dtype=torch.long
         )
@@ -480,7 +453,7 @@ class KawaiiLLMModel(nn.Module):
             if ni == 0:
                 # NTP sample in mixed batch: entire prefix is masked padding
                 prefix_embeds_list.append(
-                    pad_embed_vec.unsqueeze(0).expand(max_prefix_len, -1).clone()
+                    projected.new_zeros(max_prefix_len, projected.size(-1))
                 )
                 prefix_mask_list.append(
                     torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
@@ -490,7 +463,7 @@ class KawaiiLLMModel(nn.Module):
                 parts = []
                 if pad_len > 0:
                     parts.append(
-                        pad_embed_vec.unsqueeze(0).expand(pad_len, -1).clone()
+                        projected.new_zeros(pad_len, projected.size(-1))
                     )
                 parts.append(mem_start_emb.unsqueeze(0))   # [1, llm_hidden]
                 parts.append(projected[i, :ni])             # [ni, llm_hidden]
