@@ -119,6 +119,7 @@ class KawaiiLLMModel(nn.Module):
         self._mem_token_id: Optional[int] = None
         self._mem_end_token_id: Optional[int] = None
         self._ae_token_id: Optional[int] = None
+        self._pad_token_id: Optional[int] = None
 
         logger.info(
             "KawaiiLLM initialized: meme_hidden=%d, llm_hidden=%d, "
@@ -134,16 +135,19 @@ class KawaiiLLMModel(nn.Module):
 
         Args:
             token_ids: mapping from token string to ID, e.g.
-                {"<mem>": 151936, "</mem>": 151938, "<AE>": 151939}
+                {"<mem>": 151936, "</mem>": 151938, "<AE>": 151939,
+                 "pad_token_id": 151643}
         """
         self._mem_token_id = token_ids["<mem>"]
         self._mem_end_token_id = token_ids["</mem>"]
         self._ae_token_id = token_ids["<AE>"]
+        self._pad_token_id = token_ids["pad_token_id"]
         logger.info(
-            "Special token IDs set: <mem>=%d, </mem>=%d, <AE>=%d",
+            "Special token IDs set: <mem>=%d, </mem>=%d, <AE>=%d, pad=%s",
             self._mem_token_id,
             self._mem_end_token_id,
             self._ae_token_id,
+            self._pad_token_id,
         )
 
     @staticmethod
@@ -372,7 +376,16 @@ class KawaiiLLMModel(nn.Module):
                 # softmax over all-masked keys).  We also mask labels[0] so
                 # no loss is computed at the prefix-to-target boundary where
                 # logits are based on the dummy input.
-                prefix_embeds = target_embeds.new_zeros(B, 1, llm_hidden)
+                #
+                # Use pad token embedding instead of zeros.  Zero embeddings
+                # cause RMSNorm backward to amplify gradients by 1/sqrt(eps)
+                # ≈ 1000× per layer.  After ~12 layers this overflows to inf
+                # in bfloat16; inf × V(=0) = NaN in attention backward,
+                # poisoning all positions' gradients through softmax.
+                pad_id = torch.full(
+                    (1, 1), self._pad_token_id, device=device, dtype=torch.long,
+                )
+                prefix_embeds = llm_embed(pad_id).detach().expand(B, -1, -1)
                 prefix_embeds = prefix_embeds + (dummy_proj.sum() * 0.0)
                 prefix_mask = attention_mask.new_ones(B, 1)
 
@@ -461,13 +474,20 @@ class KawaiiLLMModel(nn.Module):
         prefix_embeds_list = []
         prefix_mask_list = []
 
+        # Pad embedding for left-padded positions (non-zero to prevent NaN;
+        # see NTP-path comment for the full RMSNorm backward explanation).
+        pad_id = torch.full(
+            (1,), self._pad_token_id, device=device, dtype=torch.long,
+        )
+        pad_embed_vec = llm_embed(pad_id).detach().squeeze(0)  # [llm_hidden]
+
         for i in range(B):
             ni = n_mem[i].item()
 
             if ni == 0:
                 # NTP sample in mixed batch: entire prefix is masked padding
                 prefix_embeds_list.append(
-                    torch.zeros(max_prefix_len, llm_hidden, device=device, dtype=projected.dtype)
+                    pad_embed_vec.unsqueeze(0).expand(max_prefix_len, -1).clone()
                 )
                 prefix_mask_list.append(
                     torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
@@ -477,7 +497,7 @@ class KawaiiLLMModel(nn.Module):
                 parts = []
                 if pad_len > 0:
                     parts.append(
-                        torch.zeros(pad_len, llm_hidden, device=device, dtype=projected.dtype)
+                        pad_embed_vec.unsqueeze(0).expand(pad_len, -1).clone()
                     )
                 parts.append(mem_start_emb.unsqueeze(0))   # [1, llm_hidden]
                 parts.append(projected[i, :ni])             # [ni, llm_hidden]

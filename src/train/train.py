@@ -120,6 +120,7 @@ def train():
     special_token_ids = {
         tok: tokenizer.convert_tokens_to_ids(tok) for tok in SPECIAL_TOKENS
     }
+    special_token_ids["pad_token_id"] = tokenizer.pad_token_id
     model.set_special_token_ids(special_token_ids)
 
     # Enable gradient checkpointing.
