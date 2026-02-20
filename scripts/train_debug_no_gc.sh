@@ -27,8 +27,8 @@ set -euo pipefail
 
 deepspeed --num_gpus 8 --module src.train.train \
   --deepspeed configs/ds_zero2.json \
-  --meme_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-Embedding-4B-main/ \
-  --llm_model_name_or_path /lpai/inputs/models/qwen__qwen3-8b-base-25-04-28-1833/ \
+  --meme_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-Embedding-0.6B-main/ \
+  --llm_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-4B-Base-main/ \
   --data_dirs \
     data/novels/formatted \
     data/bilibili/formatted \
