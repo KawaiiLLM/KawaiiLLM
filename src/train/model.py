@@ -165,13 +165,11 @@ class KawaiiLLMModel(nn.Module):
         return self.llm.device
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Enable gradient checkpointing on LLM only.
-
-        MemE (4B) runs WITHOUT gradient checkpointing even when unfrozen.
-        Qwen3-Embedding's custom attention backward + gradient checkpointing
-        re-run can produce NaN gradients.  The memory cost of storing MemE
-        activations (~2-3 GB) is acceptable on 80GB GPUs.
-        """
+        """Enable gradient checkpointing on both MemE and LLM."""
+        if not self._freeze_meme:
+            self.meme.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
         self.llm.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
         )
