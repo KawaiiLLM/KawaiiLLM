@@ -32,6 +32,14 @@ class ModelArguments:
         default=False,
         metadata={"help": "Freeze projector weights."},
     )
+    attn_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Attention implementation for LLM: 'eager', 'sdpa', or "
+            "'flash_attention_2'. If None, uses model default. "
+            "Use 'eager' to bypass Flash Attention numerical issues."
+        },
+    )
     # Per-component learning rates
     meme_lr: Optional[float] = field(
         default=None,

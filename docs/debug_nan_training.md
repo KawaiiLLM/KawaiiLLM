@@ -238,11 +238,76 @@ DEBUG step=1 | loss=X.XXXX | has_nan=False has_inf=False ...
 | `src/train/model.py:385-389` | **NTP prefix：pad embedding 替代零嵌入（NaN 修复）** |
 | `src/train/model.py:477-482` | **Mixed prefix：pad embedding 替代零嵌入（NaN 修复）** |
 | `src/train/model.py:265` | `extended_mask[:, 0] = 1`：防止左填充 position 0 的 softmax NaN |
-| `src/train/model.py:173` | `gradient_checkpointing_enable()`：MemE + LLM 均启用 GC |
-| `src/train/train.py:123` | `pad_token_id` 传递给 model |
-| `src/train/train.py:131` | GC 启用：`use_reentrant=False` |
 | `src/train/trainer.py:19` | `NaNDetectorCallback`：step 1 后检查参数 NaN |
 | `src/train/trainer.py:108` | `compute_loss()`：debug 日志（前 3 个 optimizer step） |
+
+---
+
+## Commit 历史
+
+| Commit | 说明 | 结果 |
+|--------|------|------|
+| 8cc444a | 修复 encode_context 中 extended_mask position 0 | step 1 仍 NaN，假设 1 排除 |
+| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除，诊断代码就位 |
+| 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
+| 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
+| 6f24817 | 移除 `attn_implementation="eager"`（已排除，且导致 OOM） | 消除 eager attention OOM |
+| c7892e6 | 根因修复：零嵌入 → pad embedding（NTP path + 混合 path padding） | 部分修复：NTP path 干净，但 n_mem>0 的混合 path 仍有 GRAD_NaN |
+
+---
+
+### 阶段 9 — 二次定位：近零 projected tokens 的 RMSNorm 梯度放大
+
+**输入**：应用 pad-embedding 修复后的训练日志（`scripts/train_debug_no_gc.sh`）
+
+**观察**：
+- Forward 全部干净（所有 logits 有限，无 NaN/Inf）
+- GRAD_NaN 仅在 `fwd=7`（n_mem=10）触发，128 个微批次中仅 1 个
+- NaN 出现在 `target_embeds` 梯度中 — 说明 NaN 源于 LLM backward 内部
+- eager attention 已在阶段 5 排除（commit 539502c），Flash Attention 不是原因
+
+**根因分析**：
+
+Projector 最后一层 init std=1e-4，产生输出 std ≈ 0.003。正常 LLM embedding RMS ≈ 0.02。
+
+RMSNorm backward 梯度放大：`d_rmsnorm/d_x ∝ 1/RMS(x)`
+- 正常 embedding (RMS ≈ 0.02)：放大 ≈ 50×
+- 近零 projected (RMS ≈ 0.003)：放大 ≈ 333×（7× 高于正常值）
+
+虽然残差连接阻止了跨层乘性放大，但 7× 的额外放大因子对特定数据模式在 bfloat16 精度下足以触发 NaN（1/128 的概率说明是边界情况）。
+
+**修复：残差嵌入初始化 (Residual Embedding Init)**
+
+在 projected tokens 上叠加 detached 的 pad token embedding 作为常数基底：
+```python
+pad_embed_vec = llm_embed(pad_token_id).detach()
+projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
+```
+
+效果：
+- Projected tokens 初始 RMS ≈ 0.02（与正常 embedding 相同）
+- RMSNorm backward 放大因子从 333× 降至 ≈ 50×（与正常 embedding 一致）
+- Projector 输出作为 learned perturbation，训练中逐渐增大
+- 不影响梯度方向（常数偏移的导数为 0），只改变 RMSNorm 的工作点
+
+同时添加：
+- `register_nan_gradient_hooks()`：参数级 NaN → 0 安全网，防止单个坏微批次毒化梯度累积
+- `attn_implementation` 参数：虽然 eager attention 已排除为根因，保留选项用于未来调试
+
+| (待定) | 残差嵌入 + NaN 梯度安全网 | 待验证 |
+
+---
+
+## 关键代码位置
+
+| 位置 | 说明 |
+|------|------|
+| `src/train/model.py:516-524` | 残差嵌入：`projected = projected + pad_embed_vec` |
+| `src/train/model.py:199-234` | `register_nan_gradient_hooks()`：参数级 NaN → 0 |
+| `src/train/model.py:59` | `attn_implementation` 参数 |
+| `src/train/model.py:265` | `extended_mask[:, 0] = 1`：MemE 左填充 NaN 防护 |
+| `src/train/model.py:574` | `prefix_attn[:, 0] = 1`：LLM 前缀左填充 NaN 防护 |
+| `src/train/train.py:140` | `model.register_nan_gradient_hooks()` 调用 |
 
 ---
 
@@ -257,19 +322,8 @@ DEBUG step=1 | loss=X.XXXX | has_nan=False has_inf=False ...
 - **Loss 计算**：`ForCausalLMLoss` 将 logits upcast 至 float32，使用标准 `F.cross_entropy`
 - **Loss scaling**：DeepSpeed bf16 使用 loss_scale=1.0，不存在梯度放大
 - **Gradient Checkpointing**：不是 NaN 的根因（禁用后 NaN 仍在）
-
----
-
-## Commit 历史
-
-| Commit | 说明 | 结果 |
-|--------|------|------|
-| 8cc444a | 修复 encode_context 中 extended_mask position 0 | step 1 仍 NaN，假设 1 排除 |
-| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除，诊断代码就位 |
-| 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
-| 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
-| 6f24817 | 移除 `attn_implementation="eager"`（已排除，且导致 OOM） | 消除 eager attention OOM |
-| (待定) | **根因修复：零嵌入 → pad embedding** | 待验证 |
+- **Flash/Eager Attention**：不是 NaN 的根因（eager attention NaN 模式不变）
+- **NTP path 零嵌入**：已修复（pad embedding 替代 torch.zeros）
 
 ---
 
@@ -279,4 +333,5 @@ DEBUG step=1 | loss=X.XXXX | has_nan=False has_inf=False ...
 
 1. `src/train/model.py`：删除 `_grad_hook_count` 和所有 `_make_hook` / `_make_ntp_hook` 代码块
 2. `src/train/trainer.py`：删除 `NaNDetectorCallback` 类和 `compute_loss` 中的 debug logging（`if self.state.global_step < 3` 代码块）
+3. `src/train/model.py`：如果 NaN 梯度安全网从未触发，可以移除 `register_nan_gradient_hooks()`
 3. `src/train/train.py`：删除 `NaNDetectorCallback` 的 import 和注册

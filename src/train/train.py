@@ -96,6 +96,7 @@ def train():
             freeze_meme=model_args.freeze_meme,
             freeze_llm=model_args.freeze_llm,
             freeze_projector=model_args.freeze_projector,
+            attn_implementation=model_args.attn_implementation,
         )
     else:
         logger.info("Building model from pretrained weights")
@@ -106,6 +107,7 @@ def train():
             freeze_meme=model_args.freeze_meme,
             freeze_llm=model_args.freeze_llm,
             freeze_projector=model_args.freeze_projector,
+            attn_implementation=model_args.attn_implementation,
         )
 
     # Resize embeddings to accommodate special tokens
@@ -132,6 +134,10 @@ def train():
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         model.enable_input_require_grads()
+
+    # Register NaN gradient guard — replaces NaN gradients with zero to
+    # prevent a single corrupted micro-batch from poisoning training.
+    model.register_nan_gradient_hooks()
 
     # Log parameter counts
     total, trainable = count_parameters(model)

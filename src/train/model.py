@@ -56,6 +56,7 @@ class KawaiiLLMModel(nn.Module):
         freeze_meme: bool = False,
         freeze_llm: bool = False,
         freeze_projector: bool = False,
+        attn_implementation: Optional[str] = None,
     ):
         super().__init__()
 
@@ -70,10 +71,15 @@ class KawaiiLLMModel(nn.Module):
 
         # Load LLM decoder.
         logger.info("Loading LLM from %s", llm_model_name_or_path)
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_model_name_or_path,
+        llm_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+        )
+        if attn_implementation:
+            llm_kwargs["attn_implementation"] = attn_implementation
+            logger.info("LLM attention implementation: %s", attn_implementation)
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            llm_model_name_or_path, **llm_kwargs,
         )
         llm_hidden = self.llm.config.hidden_size
 
@@ -120,6 +126,8 @@ class KawaiiLLMModel(nn.Module):
         self._mem_end_token_id: Optional[int] = None
         self._ae_token_id: Optional[int] = None
         self._pad_token_id: Optional[int] = None
+
+        self._nan_hook_handles = []  # for NaN gradient guard hooks
 
         logger.info(
             "KawaiiLLM initialized: meme_hidden=%d, llm_hidden=%d, "
@@ -187,6 +195,43 @@ class KawaiiLLMModel(nn.Module):
         """Required when gradient checkpointing is used with frozen params."""
         self.meme.enable_input_require_grads()
         self.llm.enable_input_require_grads()
+
+    def register_nan_gradient_hooks(self):
+        """Register backward hooks that replace NaN gradients with zero.
+
+        Prevents a single corrupted micro-batch from poisoning the entire
+        gradient accumulation (NaN + finite = NaN in IEEE 754).  Hooks fire
+        during backward for each micro-batch, BEFORE gradient accumulation.
+
+        Also logs the first few occurrences per parameter for diagnosis.
+        """
+        nan_counts = {}
+
+        def _make_hook(param_name):
+            nan_counts[param_name] = 0
+
+            def _hook(grad):
+                if not torch.isnan(grad).any():
+                    return grad
+                nan_counts[param_name] += 1
+                if nan_counts[param_name] <= 3:
+                    logger.warning(
+                        "NaN gradient in %s (occurrence %d), zeroing",
+                        param_name, nan_counts[param_name],
+                    )
+                return torch.zeros_like(grad)
+
+            return _hook
+
+        count = 0
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            handle = param.register_hook(_make_hook(name))
+            self._nan_hook_handles.append(handle)
+            count += 1
+
+        logger.info("Registered NaN gradient guard on %d parameters", count)
 
     def encode_context(
         self,
@@ -460,6 +505,24 @@ class KawaiiLLMModel(nn.Module):
             projected = projected_sub.new_zeros(B, max_n_mem, projected_sub.size(-1))
             projected[mem_idx] = projected_sub
 
+        # Pad token embedding — used in two places below:
+        # 1. Residual base for projected tokens (numerical stability)
+        # 2. Fill for left-padded prefix positions
+        pad_id = torch.full(
+            (1,), self._pad_token_id, device=device, dtype=torch.long,
+        )
+        pad_embed_vec = llm_embed(pad_id).detach().squeeze(0)  # [llm_hidden]
+
+        # Residual embedding: add detached pad embedding as constant base.
+        # The projector output starts near-zero (std ≈ 0.003 from init).
+        # When this enters the LLM, each RMSNorm layer amplifies backward
+        # gradients by ~1/RMS ≈ 333× (vs 50× for normal embeddings at
+        # RMS ≈ 0.02).  For specific data patterns this compounds enough
+        # to produce NaN in bfloat16.  Adding a constant base ensures the
+        # prefix tokens have normal magnitude, bounding the amplification.
+        # The projector output acts as a learned perturbation on top.
+        projected = projected + pad_embed_vec.unsqueeze(0).unsqueeze(0)
+
         # 2. Build per-sample left-padded prefix
         mem_start_id = torch.tensor(
             [self._mem_token_id], device=device, dtype=torch.long
@@ -473,13 +536,6 @@ class KawaiiLLMModel(nn.Module):
         max_prefix_len = max_n_mem + 2  # <mem>(1) + max_n_mem + </mem>(1)
         prefix_embeds_list = []
         prefix_mask_list = []
-
-        # Pad embedding for left-padded positions (non-zero to prevent NaN;
-        # see NTP-path comment for the full RMSNorm backward explanation).
-        pad_id = torch.full(
-            (1,), self._pad_token_id, device=device, dtype=torch.long,
-        )
-        pad_embed_vec = llm_embed(pad_id).detach().squeeze(0)  # [llm_hidden]
 
         for i in range(B):
             ni = n_mem[i].item()
@@ -611,6 +667,7 @@ class KawaiiLLMModel(nn.Module):
         freeze_meme: bool = False,
         freeze_llm: bool = False,
         freeze_projector: bool = False,
+        attn_implementation: Optional[str] = None,
     ) -> "KawaiiLLMModel":
         """Load model from a saved checkpoint directory."""
         meme_dir = os.path.join(checkpoint_dir, "meme")
@@ -624,6 +681,7 @@ class KawaiiLLMModel(nn.Module):
             freeze_meme=freeze_meme,
             freeze_llm=freeze_llm,
             freeze_projector=freeze_projector,
+            attn_implementation=attn_implementation,
         )
 
         # Load projector + mem_embeddings weights
