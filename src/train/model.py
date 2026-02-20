@@ -203,8 +203,13 @@ class KawaiiLLMModel(nn.Module):
         gradient accumulation (NaN + finite = NaN in IEEE 754).  Also catches
         inf gradients: bf16 matmul overflow produces inf, which DeepSpeed
         gradient clipping turns into NaN via inf * (max_norm / inf) = inf * 0
-        = NaN (IEEE 754).  Hooks fire during backward for each micro-batch,
-        BEFORE gradient accumulation.
+        = NaN (IEEE 754).
+
+        Uses in-place nan_to_num_() instead of returning a new tensor because
+        DeepSpeed ZeRO-2 may capture the gradient tensor into its own buffer.
+        In-place modification ensures any reference to the tensor sees sanitized
+        values.  Requires overlap_comm=false and contiguous_gradients=false in
+        the DeepSpeed config to prevent async/buffer bypass.
 
         Also logs the first few occurrences per parameter for diagnosis.
         """
@@ -225,7 +230,8 @@ class KawaiiLLMModel(nn.Module):
                         param_name, bad_counts[param_name],
                         has_nan.item(), has_inf.item(),
                     )
-                return torch.zeros_like(grad)
+                grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                return grad
 
             return _hook
 

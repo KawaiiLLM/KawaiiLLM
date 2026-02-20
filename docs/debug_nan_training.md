@@ -421,6 +421,36 @@ All parameters clean after step 0
 
 ---
 
+### 阶段 12 — register_hook 返回值被 DeepSpeed ZeRO-2 绕过
+
+**问题**：Phase 10 的 inf 检测 + Phase 11 的 `communication_data_type=fp32` 应用后，重新运行 8 卡训练仍然崩溃。
+
+**新证据**：
+- 梯度 hook **在各卡上触发**：`layers.10/15/33.mlp.down_proj.weight` 报告 `inf=True`
+- hook 声称 "zeroing" 但 NaNDetectorCallback 显示 step 0 后全部 404 参数 NaN/inf
+- inf 来源是**单卡 backward**（非 allreduce）——长序列（2000-4000 tokens）导致 `activation^T @ grad_output` 在 bf16 下溢出
+
+**根因**：hook 返回 `torch.zeros_like(grad)`（**新张量**），但 DeepSpeed ZeRO-2 通过自己的机制捕获梯度：
+1. `contiguous_gradients: true`——预分配连续缓冲区，backward 时梯度数据直接拷贝进去，hook 返回的新张量不影响缓冲区
+2. `overlap_comm: true`——异步启动 allreduce，可能在 hook 执行完毕前就读取了原始梯度
+3. Accelerate 的 `DeepSpeedEngineWrapper.backward()` 在最后一个微批次中原子地调用 `engine.backward()` + `engine.step()`，Trainer 层面无法在两者之间插入清理
+
+**级联效应**：当 `down_proj` backward 产生 inf 激活梯度时，该 inf 回传到所有更早的层，导致全部参数梯度变 inf。hook 虽然逐个清零，但 DeepSpeed 的缓冲区已经持有原始 inf 值。
+
+**修复（3 处变更）**：
+
+1. `configs/ds_zero2.json`：
+   - `overlap_comm: false`——禁用异步通信，确保 hook 在 allreduce 前完成
+   - `contiguous_gradients: false`——强制使用 `param.grad` 而非预分配缓冲区
+
+2. `src/train/model.py` `_hook()`：
+   - `torch.zeros_like(grad)` → `grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0); return grad`
+   - 原地修改确保任何持有该张量引用的代码（包括 DeepSpeed）看到清理后的值
+
+3. 性能影响：无通信重叠 + 非连续梯度布局 → 略慢，但保证正确性
+
+---
+
 ## 后续清理（训练稳定后）
 
 确认 step 1 loss 正常、grad_norm 有限后，可以删除以下诊断代码：
