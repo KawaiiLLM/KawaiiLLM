@@ -17,29 +17,46 @@ logger = logging.getLogger(__name__)
 
 
 class NaNDetectorCallback(TrainerCallback):
-    """Detect which parameters become NaN/inf after the first optimizer step."""
+    """Report gradient explosions per step and detect NaN parameters after step 0."""
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step != 1 or model is None:
+        if model is None:
             return
         m = model.module if hasattr(model, "module") else model
-        bad_by_component = {}
-        for name, param in m.named_parameters():
-            if not (torch.isnan(param.data).any() or torch.isinf(param.data).any()):
-                continue
-            component = name.split(".")[0]
-            if component not in bad_by_component:
-                bad_by_component[component] = []
-            bad_by_component[component].append(name)
 
-        if bad_by_component:
-            for comp, params in bad_by_component.items():
-                logger.error(
-                    "Bad values (NaN/inf) after step 0 in [%s]: %d params, first 5: %s",
-                    comp, len(params), params[:5],
+        # Collect explosion stats on all ranks (to reset counters), log on rank 0 only
+        if hasattr(m, "get_and_reset_explosion_stats"):
+            stats = m.get_and_reset_explosion_stats()
+            if stats and args.local_process_index == 0:
+                total = sum(stats.values())
+                by_comp: Dict[str, int] = {}
+                for name, count in stats.items():
+                    comp = name.split(".")[0]
+                    by_comp[comp] = by_comp.get(comp, 0) + count
+                logger.warning(
+                    "Step %d: %d gradient explosion(s) zeroed — %s",
+                    state.global_step,
+                    total,
+                    ", ".join(f"{c}:{n}" for c, n in sorted(by_comp.items())),
                 )
-        else:
-            logger.info("All parameters clean after step 0")
+
+        # After step 0: sanity-check that no parameters became NaN/inf
+        if state.global_step == 1:
+            bad_by_component: Dict[str, list] = {}
+            for name, param in m.named_parameters():
+                if not (torch.isnan(param.data).any() or torch.isinf(param.data).any()):
+                    continue
+                comp = name.split(".")[0]
+                bad_by_component.setdefault(comp, []).append(name)
+
+            if bad_by_component:
+                for comp, params in bad_by_component.items():
+                    logger.error(
+                        "NaN/inf parameters after step 0 in [%s]: %d, first 5: %s",
+                        comp, len(params), params[:5],
+                    )
+            else:
+                logger.info("All parameters clean after step 0")
 
 
 class CurriculumCallback(TrainerCallback):
@@ -119,36 +136,6 @@ class KawaiiTrainer(Trainer):
         )
 
         loss = outputs.loss
-
-        # --- Debug logging for first 3 optimizer steps ---
-        if self.state.global_step < 3:
-            import torch
-            labels = inputs["labels"]
-            valid = (labels != -100).sum().item()
-            total = labels.numel()
-            logits = outputs.logits
-            logger.info(
-                "DEBUG step=%d | loss=%.4f | loss_dtype=%s | "
-                "logits shape=%s dtype=%s min=%.4f max=%.4f "
-                "has_nan=%s has_inf=%s | "
-                "labels valid=%d/%d | n_mem=%s | "
-                "input_ids shape=%s attn_mask sum=%s",
-                self.state.global_step,
-                loss.item(),
-                loss.dtype,
-                logits.shape,
-                logits.dtype,
-                logits.float().min().item(),
-                logits.float().max().item(),
-                torch.isnan(logits).any().item(),
-                torch.isinf(logits).any().item(),
-                valid,
-                total,
-                n_mem.tolist(),
-                inputs["input_ids"].shape,
-                inputs["attention_mask"].sum(dim=1).tolist(),
-            )
-
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):

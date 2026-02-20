@@ -201,61 +201,6 @@ prefix_attn[:, 0] = 1                         # Mixed
 
 ---
 
-## 下一步
-
-1. **验证 communication_data_type=fp32 修复**：重新运行 `bash scripts/train_debug_no_gc.sh`（8 卡），确认 `All parameters clean after step 0` 且 `grad_norm` 有限
-2. **恢复完整训练**：确认修复后，使用 `scripts/train_8xa800.sh` 启动正式训练（含 GC）
-3. **清理诊断代码**：训练稳定后删除 `_grad_hook_count`、debug logging 等（见下方清理清单）
-
----
-
-## 验证标准
-
-训练成功的标志：
-
-```
-# 1. 梯度 hook 不应出现 NaN
-# 不应看到：GRAD_NaN fwd=X ...
-
-# 2. NaNDetectorCallback 应报告正常
-All parameters clean after step 0
-
-# 3. DEBUG step=1 应有正常 loss（不应是 nan）
-DEBUG step=1 | loss=X.XXXX | has_nan=False has_inf=False ...
-
-# 4. grad_norm 应有限
-{'loss': X.XX, 'grad_norm': Y.YY, 'learning_rate': ..., 'epoch': ...}
-```
-
----
-
-## 关键代码位置
-
-| 文件 | 关键行为 |
-|------|---------|
-| `src/train/model.py:64` | MemE 加载 |
-| `src/train/model.py:73` | LLM 加载 |
-| `src/train/model.py:385-389` | **NTP prefix：pad embedding 替代零嵌入（NaN 修复）** |
-| `src/train/model.py:477-482` | **Mixed prefix：pad embedding 替代零嵌入（NaN 修复）** |
-| `src/train/model.py:265` | `extended_mask[:, 0] = 1`：防止左填充 position 0 的 softmax NaN |
-| `src/train/trainer.py:19` | `NaNDetectorCallback`：step 1 后检查参数 NaN |
-| `src/train/trainer.py:108` | `compute_loss()`：debug 日志（前 3 个 optimizer step） |
-
----
-
-## Commit 历史
-
-| Commit | 说明 | 结果 |
-|--------|------|------|
-| 8cc444a | 修复 encode_context 中 extended_mask position 0 | step 1 仍 NaN，假设 1 排除 |
-| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除，诊断代码就位 |
-| 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
-| 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
-| 6f24817 | 移除 `attn_implementation="eager"`（已排除，且导致 OOM） | 消除 eager attention OOM |
-| c7892e6 | 根因修复：零嵌入 → pad embedding（NTP path + 混合 path padding） | 部分修复：NTP path 干净，但 n_mem>0 的混合 path 仍有 GRAD_NaN |
-
----
-
 ### 阶段 9 — 二次定位：近零 projected tokens 的 RMSNorm 梯度放大
 
 **输入**：应用 pad-embedding 修复后的训练日志（`scripts/train_debug_no_gc.sh`）
@@ -293,24 +238,6 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 同时添加：
 - `register_nan_gradient_hooks()`：参数级 NaN → 0 安全网，防止单个坏微批次毒化梯度累积
 - `attn_implementation` 参数：虽然 eager attention 已排除为根因，保留选项用于未来调试
-
-| fe3004d | 残差嵌入：`projected += pad_embed_vec`，阻止 RMSNorm 梯度爆炸 | 梯度 hook 不再触发，但 8 卡仍 NaN（下一阶段） |
-| 9602b52 | 梯度安全网扩展：同时检查 isnan + isinf | 诊断工具就绪 |
-| f940fd9 | 单卡无 DS 诊断脚本 `train_debug_no_ds.sh` | 单卡 5 步完全正常，确认 allreduce 是根因 |
-| b50e1d5 | `communication_data_type=fp32`：allreduce 在 fp32 下进行 | **待 8 卡验证** |
-
----
-
-## 关键代码位置
-
-| 位置 | 说明 |
-|------|------|
-| `src/train/model.py:516-524` | 残差嵌入：`projected = projected + pad_embed_vec` |
-| `src/train/model.py:199-234` | `register_nan_gradient_hooks()`：参数级 NaN → 0 |
-| `src/train/model.py:59` | `attn_implementation` 参数 |
-| `src/train/model.py:265` | `extended_mask[:, 0] = 1`：MemE 左填充 NaN 防护 |
-| `src/train/model.py:574` | `prefix_attn[:, 0] = 1`：LLM 前缀左填充 NaN 防护 |
-| `src/train/train.py:140` | `model.register_nan_gradient_hooks()` 调用 |
 
 ---
 
@@ -449,13 +376,75 @@ All parameters clean after step 0
 
 3. 性能影响：无通信重叠 + 非连续梯度布局 → 略慢，但保证正确性
 
+**验证结果（Phase 12 已确认有效）**：
+
+```
+All parameters clean after step 0  (×6，各 GPU 独立上报)
+{'loss': 36.8349, 'grad_norm': 397.7725, 'learning_rate': 0.0, 'epoch': 0.0}
+{'loss': 37.1849, 'grad_norm': 34.9922, 'learning_rate': 1e-05, 'epoch': 0.0}
+{'loss': 35.2196, 'grad_norm': 13.4882, 'learning_rate': 9.989e-06, ...}
+{'loss': 36.4791, 'grad_norm': 9.7979, ...}
+...（grad_norm 持续收敛，训练稳定）
+```
+
+grad_norm 从 397 迅速降至个位数说明模型权重完好，梯度正常流动。loss ≈ 36 对应每步约 16 个梯度累积微批次的总和（36 / 16 ≈ 2.25/sample，合理）。
+
 ---
 
-## 后续清理（训练稳定后）
+### 阶段 13 — 日志清理 + 爆炸检测重构
 
-确认 step 1 loss 正常、grad_norm 有限后，可以删除以下诊断代码：
+**背景**：Phase 12 验证通过后，清理遗留的调试代码，并将爆炸检测从"逐条警告"改为"每步汇总"。
 
-1. `src/train/model.py`：删除 `_grad_hook_count` 和所有 `_make_hook` / `_make_ntp_hook` 代码块
-2. `src/train/trainer.py`：删除 `NaNDetectorCallback` 类和 `compute_loss` 中的 debug logging（`if self.state.global_step < 3` 代码块）
-3. `src/train/model.py`：如果 NaN 梯度安全网从未触发，可以移除 `register_nan_gradient_hooks()`
-3. `src/train/train.py`：删除 `NaNDetectorCallback` 的 import 和注册
+**删除的冗余日志**：
+
+1. `compute_loss` 中的 DEBUG 块——每个 micro-batch 都打印 logits 统计信息，训练稳定后无意义
+2. `model.py forward()` 中的两处内联梯度 hook：
+   - NTP 路径：`GRAD_NaN fwd=N NTP_dummy_proj / NTP_combined_embeds`
+   - 非 NTP 路径：`GRAD_NaN fwd=N projected / mem_hidden / llm_input / target_embeds`
+3. `_grad_hook_count` 计数器（驱动上述内联 hook 的开关）
+
+**新增爆炸检测设计**：
+
+`register_nan_gradient_hooks()` 改为将每次爆炸计入 `self._explosion_counts[param_name]`，不再逐条打印。`NaNDetectorCallback.on_step_end` 每步调用 `get_and_reset_explosion_stats()` 汇总并上报：
+
+```
+Step 5: 112 gradient explosion(s) zeroed — llm:108, projector:4
+```
+
+无爆炸时静默，有爆炸时一行 WARNING，按组件汇总总数。只在 local rank 0 打印，避免 8 卡重复。
+
+`NaNDetectorCallback` 保留 step 0 后的参数 NaN 检查（作为安全网，验证修复是否失效）。
+
+---
+
+## 关键代码位置
+
+| 文件 | 行为 |
+|------|------|
+| `src/train/model.py:265` | `extended_mask[:, 0] = 1`：防止 MemE 左填充 position 0 的 softmax NaN |
+| `src/train/model.py:199` | `register_nan_gradient_hooks()`：参数级梯度爆炸安全网，计数到 `_explosion_counts` |
+| `src/train/model.py:236` | `get_and_reset_explosion_stats()`：查询并重置爆炸计数 |
+| `src/train/model.py:536` | 残差嵌入：`projected += pad_embed_vec`，防止 RMSNorm 梯度爆炸 |
+| `src/train/model.py:574` | `prefix_attn[:, 0] = 1`：LLM 前缀左填充 NaN 防护 |
+| `src/train/trainer.py:19` | `NaNDetectorCallback`：每步爆炸汇总 + step 0 后参数 NaN 检查 |
+| `src/train/train.py:140` | `model.register_nan_gradient_hooks()` 调用 |
+| `configs/ds_zero2.json` | `overlap_comm=false, contiguous_gradients=false, communication_data_type=fp32` |
+
+---
+
+## Commit 历史（完整）
+
+| Commit | 说明 | 结果 |
+|--------|------|------|
+| 8cc444a | 修复 encode_context 中 extended_mask position 0 | step 1 仍 NaN，假设 1 排除 |
+| d4f7adc | 禁用 MemE GC + NaNDetectorCallback + 梯度 NaN hook | OOM，假设 2 排除，诊断代码就位 |
+| 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
+| 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
+| 6f24817 | 移除 `attn_implementation="eager"` | 消除 eager attention OOM |
+| c7892e6 | 根因修复：零嵌入 → pad embedding | NTP path 干净，n_mem>0 仍有 GRAD_NaN |
+| fe3004d | 残差嵌入：`projected += pad_embed_vec` | 梯度 hook 不再触发，但 8 卡仍 NaN |
+| 9602b52 | 梯度安全网扩展：同时检查 isnan + isinf | 诊断工具就绪 |
+| f940fd9 | 单卡无 DS 诊断脚本 | 单卡正常，确认 allreduce 是根因 |
+| b50e1d5 | `communication_data_type=fp32` | allreduce 溢出修复，但 hook bypass 问题仍存在 |
+| 6525f09 | 文档：Phase 11 allreduce 溢出根因 | — |
+| 9f143be | Phase 12：in-place nan_to_num + DS config 修复 hook bypass | **8 卡验证通过，训练稳定** |

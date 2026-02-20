@@ -119,7 +119,7 @@ class KawaiiLLMModel(nn.Module):
 
         self._freeze_meme = freeze_meme
         self.num_mem_tokens = num_mem_tokens
-        self._grad_hook_count = 0  # counter for gradient NaN detection
+        self._explosion_counts: Dict[str, int] = {}  # per-step gradient explosion counts
 
         # Special token IDs (set by set_special_token_ids after tokenizer registration)
         self._mem_token_id: Optional[int] = None
@@ -211,28 +211,17 @@ class KawaiiLLMModel(nn.Module):
         values.  Requires overlap_comm=false and contiguous_gradients=false in
         the DeepSpeed config to prevent async/buffer bypass.
 
-        Also logs the first few occurrences per parameter for diagnosis.
+        Explosion counts are accumulated in self._explosion_counts per parameter
+        and can be queried and reset with get_and_reset_explosion_stats().
         """
-        bad_counts = {}
-
         def _make_hook(param_name):
-            bad_counts[param_name] = 0
-
             def _hook(grad):
-                has_nan = torch.isnan(grad).any()
-                has_inf = torch.isinf(grad).any()
-                if not (has_nan or has_inf):
-                    return grad
-                bad_counts[param_name] += 1
-                if bad_counts[param_name] <= 3:
-                    logger.warning(
-                        "Bad gradient in %s (occurrence %d): nan=%s inf=%s, zeroing",
-                        param_name, bad_counts[param_name],
-                        has_nan.item(), has_inf.item(),
+                if torch.isnan(grad).any() or torch.isinf(grad).any():
+                    self._explosion_counts[param_name] = (
+                        self._explosion_counts.get(param_name, 0) + 1
                     )
-                grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                    grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 return grad
-
             return _hook
 
         count = 0
@@ -244,6 +233,12 @@ class KawaiiLLMModel(nn.Module):
             count += 1
 
         logger.info("Registered NaN gradient guard on %d parameters", count)
+
+    def get_and_reset_explosion_stats(self) -> Dict[str, int]:
+        """Return per-parameter explosion counts since last call and reset."""
+        stats = dict(self._explosion_counts)
+        self._explosion_counts.clear()
+        return stats
 
     def encode_context(
         self,
@@ -457,28 +452,6 @@ class KawaiiLLMModel(nn.Module):
                 position_ids = combined_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(combined_mask == 0, 0)
 
-                # Gradient NaN hooks for NTP path
-                if self._grad_hook_count < 20:
-                    self._grad_hook_count += 1
-                    cnt = self._grad_hook_count
-
-                    def _make_ntp_hook(tag, count):
-                        def _hook(grad):
-                            has_nan = torch.isnan(grad).any().item()
-                            has_inf = torch.isinf(grad).any().item()
-                            if has_nan or has_inf:
-                                logger.error(
-                                    "GRAD_NaN fwd=%d NTP_%s shape=%s nan=%s inf=%s",
-                                    count, tag, list(grad.shape), has_nan, has_inf,
-                                )
-                            return grad
-                        return _hook
-
-                    dummy_proj.register_hook(_make_ntp_hook("dummy_proj", cnt))
-                    combined_embeds.register_hook(
-                        _make_ntp_hook("combined_embeds", cnt)
-                    )
-
                 return self.llm(
                     inputs_embeds=combined_embeds,
                     attention_mask=combined_mask,
@@ -611,28 +584,6 @@ class KawaiiLLMModel(nn.Module):
         # Non-NTP: <mem> starts at position 0 regardless of padding.
         position_ids = llm_attn_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(llm_attn_mask == 0, 0)
-
-        # --- Gradient NaN hooks (first 20 forward passes) ---
-        if self.training and self._grad_hook_count < 20:
-            self._grad_hook_count += 1
-            cnt = self._grad_hook_count
-
-            def _make_hook(tag, count):
-                def _hook(grad):
-                    has_nan = torch.isnan(grad).any().item()
-                    has_inf = torch.isinf(grad).any().item()
-                    if has_nan or has_inf:
-                        logger.error(
-                            "GRAD_NaN fwd=%d %s shape=%s nan=%s inf=%s norm=nan",
-                            count, tag, list(grad.shape), has_nan, has_inf,
-                        )
-                    return grad
-                return _hook
-
-            projected.register_hook(_make_hook("projected", cnt))
-            mem_hidden.register_hook(_make_hook("mem_hidden", cnt))
-            llm_input.register_hook(_make_hook("llm_input", cnt))
-            target_embeds.register_hook(_make_hook("target_embeds", cnt))
 
         # 7. Forward through LLM
         outputs = self.llm(
