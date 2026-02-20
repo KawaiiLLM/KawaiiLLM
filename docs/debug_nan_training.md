@@ -258,23 +258,22 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 
 ---
 
-### 阶段 10–13 — 错误假说（已被阶段 14 推翻）
+### 阶段 10–13 — 无效假说（已撤销）
 
-> **注意**：阶段 10–13 中的 bf16 溢出假说、`register_hook` 安全网、`communication_data_type=fp32` 等均基于错误推断。阶段 14 的控制实验证明：NaN 的唯一根因是 DeepSpeed 0.16.4 的 IPG 双缓冲区竞争 bug（[#7188](https://github.com/deepspeedai/DeepSpeed/issues/7188)），与 bf16 精度无关。这些阶段的诊断代码和中间修复已全部移除。
+> 阶段 10–13 中的 bf16 溢出假说、`register_hook` 安全网、`communication_data_type=fp32` 等均基于错误推断。阶段 14 的控制实验证明 8 卡 NaN 的根因是 DeepSpeed IPG 双缓冲区竞争 bug（[#7188](https://github.com/deepspeedai/DeepSpeed/issues/7188)），与 bf16 精度无关。相关代码已全部移除。
+>
+> 注意：阶段 8/9 的 pad-embedding 和残差嵌入修复经阶段 15 反向验证**确认有效**，不在撤销范围内。
 
 **已撤销的无效修复**：
 - `register_nan_gradient_hooks()` / `get_and_reset_explosion_stats()` — 梯度本身没有 inf，hook 从未触发
 - `communication_data_type: fp32` — allreduce 不存在溢出
 - `grad.nan_to_num_()` 原地修改 — 不需要
 
-**保留的有效修复**：
-- `overlap_comm: true, contiguous_gradients: false` — 阶段 14 确定的最终方案
-
 ---
 
 ### 阶段 14 — 最终根因：DeepSpeed IPG 双缓冲区 CUDA 流竞争（已修复）
 
-**背景**：阶段 10–13 的 bf16 溢出假说一直无法自洽——单卡训练零 NaN，hook 从未真正捕获到 inf 梯度。通过控制实验彻底推翻旧假说，定位到真正根因。
+**背景**：阶段 10–13 的 bf16 溢出假说无法解释"单卡零 NaN"的事实。通过控制实验定位到 8 卡 NaN 的真正根因。
 
 **控制实验（0.6B + 4B，8×A800，context_max_length=4096）**：
 
@@ -329,11 +328,6 @@ compute stream:  copy next grad → buffer[0]        ← 覆盖！
 
 保留 `overlap_comm: true` 获得通信重叠性能，禁用 `contiguous_gradients` 消除双缓冲区竞争。
 
-**已移除的无效修复**：
-- `register_nan_gradient_hooks()` — 梯度本身无 inf/NaN，hook 计数始终为 0
-- `communication_data_type: fp32` — allreduce 不存在 bf16 溢出
-- `grad.nan_to_num_()` in-place — 不需要
-
 **相关 DeepSpeed Issue**：
 
 | Issue | 描述 |
@@ -342,6 +336,32 @@ compute stream:  copy next grad → buffer[0]        ← 覆盖！
 | [#5545](https://github.com/microsoft/DeepSpeed/issues/5545) | 同类 CUDA 流数据竞争（字节跳动报告） |
 | [PR #5606](https://github.com/microsoft/DeepSpeed/pull/5606) | 双向 stream 同步修复 |
 | [PR #7805](https://github.com/deepspeedai/DeepSpeed/pull/7805) | 综合修复（但 0.18.6 仍未彻底解决） |
+
+---
+
+### 阶段 15 — 反向验证：Phase 8/9 pad-embedding 修复确认必要
+
+**实验**：撤销 Phase 8/9 的三处 pad-embedding 修改（恢复为 `torch.zeros`），分别测试单卡和 8 卡。
+
+| 配置 | Phase 8/9 | 结果 |
+|------|:---------:|------|
+| 单 GPU | 撤销（zeros） | **NaN** |
+| 8 GPU（overlap=true, contiguous=false） | 撤销（zeros） | grad_norm = √3（模型死亡） |
+| 单 GPU | 保留（pad embed） | 正常 |
+| 8 GPU（overlap=true, contiguous=false） | 保留（pad embed） | 正常 |
+
+**结论**：零嵌入 → RMSNorm 梯度爆炸是独立于 DeepSpeed bug 的真实问题，单卡即可复现。Phase 8/9 修复已恢复。
+
+---
+
+## 最终根因总结
+
+训练 NaN 有**两个独立根因**，缺一不可地需要修复：
+
+| # | 根因 | 表现 | 修复 |
+|---|------|------|------|
+| 1 | **零嵌入 → RMSNorm 梯度爆炸**（Phase 8/9） | 单卡即 NaN：`RMSNorm(0)` backward 放大 1/√eps ≈ 1000×/层，bf16 溢出 | pad embedding 替代 zeros + 残差嵌入基底 |
+| 2 | **DeepSpeed IPG 双缓冲区竞争**（Phase 14） | 仅 8 卡 + `overlap_comm=true` + `contiguous_gradients=true` 时 NaN | `contiguous_gradients: false` |
 
 ---
 
@@ -366,13 +386,15 @@ compute stream:  copy next grad → buffer[0]        ← 覆盖！
 | 13626c3 | 恢复 MemE GC（fix OOM），保留诊断代码 | NaN 复现，hook 成功采集数据 |
 | 539502c | `attn_implementation="eager"` + `use_reentrant=False` | NaN 模式不变，假设 3 排除 |
 | 6f24817 | 移除 `attn_implementation="eager"` | 消除 eager attention OOM |
-| c7892e6 | 根因修复：零嵌入 → pad embedding | NTP path 干净，n_mem>0 仍有 GRAD_NaN |
-| fe3004d | 残差嵌入：`projected += pad_embed_vec` | 梯度 hook 不再触发，但 8 卡仍 NaN |
-| 9602b52 | ~~梯度安全网扩展~~ | 已撤销（阶段 14 证明不需要） |
-| f940fd9 | 单卡无 DS 诊断脚本 | 单卡正常，确认 allreduce 是根因 |
-| b50e1d5 | ~~`communication_data_type=fp32`~~ | 已撤销（阶段 14 证明不需要） |
-| 9f143be | ~~Phase 12: in-place nan_to_num + DS config~~ | 已撤销（阶段 14 确认只需禁用 contiguous_gradients） |
+| c7892e6 | **有效修复①**：零嵌入 → pad embedding | NTP path 干净（阶段 15 确认必要） |
+| fe3004d | **有效修复②**：残差嵌入 `projected += pad_embed_vec` | 阶段 15 确认必要 |
+| 9602b52 | ~~梯度安全网扩展~~ | 已撤销 |
+| f940fd9 | 单卡无 DS 诊断脚本 | 单卡正常 |
+| b50e1d5 | ~~`communication_data_type=fp32`~~ | 已撤销 |
+| 9f143be | ~~Phase 12: in-place nan_to_num + DS config~~ | 已撤销 |
 | c5a71d5 | ~~Phase 13: 日志清理 + 爆炸检测~~ | 已撤销 |
-| 16a8fab | 撤销 register_hook + 恢复 overlap/contiguous | 用于控制实验 |
-| e32749e | overlap_comm=false + contiguous_gradients=false，移除 fp32 allreduce | 保守方案验证通过 |
-| **最终** | `overlap_comm=true, contiguous_gradients=false` | **最终方案：保留通信重叠，禁用双缓冲区** |
+| 16a8fab | 撤销 register_hook，用于控制实验 | — |
+| e32749e | 保守方案：两者都关，移除 fp32 allreduce | 验证通过 |
+| 4f81e5b | **有效修复③**：`overlap_comm=true, contiguous_gradients=false` | 最终 DeepSpeed 配置 |
+| f8a6331 | 测试：撤销 Phase 8/9 | 单卡 NaN，确认 Phase 8/9 必要 |
+| 6ae34ee | 恢复 Phase 8/9 | **最终代码状态** |
