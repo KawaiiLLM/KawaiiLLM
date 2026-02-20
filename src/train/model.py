@@ -113,6 +113,7 @@ class KawaiiLLMModel(nn.Module):
 
         self._freeze_meme = freeze_meme
         self.num_mem_tokens = num_mem_tokens
+        self._grad_hook_count = 0  # counter for gradient NaN detection
 
         # Special token IDs (set by set_special_token_ids after tokenizer registration)
         self._mem_token_id: Optional[int] = None
@@ -164,11 +165,13 @@ class KawaiiLLMModel(nn.Module):
         return self.llm.device
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """Enable gradient checkpointing on trainable components."""
-        if not self._freeze_meme:
-            self.meme.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
-            )
+        """Enable gradient checkpointing on LLM only.
+
+        MemE (4B) runs WITHOUT gradient checkpointing even when unfrozen.
+        Qwen3-Embedding's custom attention backward + gradient checkpointing
+        re-run can produce NaN gradients.  The memory cost of storing MemE
+        activations (~2-3 GB) is acceptable on 80GB GPUs.
+        """
         self.llm.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
         )
@@ -386,6 +389,28 @@ class KawaiiLLMModel(nn.Module):
                 position_ids = combined_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(combined_mask == 0, 0)
 
+                # Gradient NaN hooks for NTP path
+                if self._grad_hook_count < 20:
+                    self._grad_hook_count += 1
+                    cnt = self._grad_hook_count
+
+                    def _make_ntp_hook(tag, count):
+                        def _hook(grad):
+                            has_nan = torch.isnan(grad).any().item()
+                            has_inf = torch.isinf(grad).any().item()
+                            if has_nan or has_inf:
+                                logger.error(
+                                    "GRAD_NaN fwd=%d NTP_%s shape=%s nan=%s inf=%s",
+                                    count, tag, list(grad.shape), has_nan, has_inf,
+                                )
+                            return grad
+                        return _hook
+
+                    dummy_proj.register_hook(_make_ntp_hook("dummy_proj", cnt))
+                    combined_embeds.register_hook(
+                        _make_ntp_hook("combined_embeds", cnt)
+                    )
+
                 return self.llm(
                     inputs_embeds=combined_embeds,
                     attention_mask=combined_mask,
@@ -500,6 +525,28 @@ class KawaiiLLMModel(nn.Module):
         # Non-NTP: <mem> starts at position 0 regardless of padding.
         position_ids = llm_attn_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(llm_attn_mask == 0, 0)
+
+        # --- Gradient NaN hooks (first 20 forward passes) ---
+        if self.training and self._grad_hook_count < 20:
+            self._grad_hook_count += 1
+            cnt = self._grad_hook_count
+
+            def _make_hook(tag, count):
+                def _hook(grad):
+                    has_nan = torch.isnan(grad).any().item()
+                    has_inf = torch.isinf(grad).any().item()
+                    if has_nan or has_inf:
+                        logger.error(
+                            "GRAD_NaN fwd=%d %s shape=%s nan=%s inf=%s norm=nan",
+                            count, tag, list(grad.shape), has_nan, has_inf,
+                        )
+                    return grad
+                return _hook
+
+            projected.register_hook(_make_hook("projected", cnt))
+            mem_hidden.register_hook(_make_hook("mem_hidden", cnt))
+            llm_input.register_hook(_make_hook("llm_input", cnt))
+            target_embeds.register_hook(_make_hook("target_embeds", cnt))
 
         # 7. Forward through LLM
         outputs = self.llm(

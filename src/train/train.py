@@ -22,7 +22,7 @@ from .arguments import DataArguments, ModelArguments, TrainingArguments
 from .collator import KawaiiDataCollator
 from .dataset import KawaiiDataset
 from .model import SPECIAL_TOKENS, KawaiiLLMModel
-from .trainer import CurriculumCallback, KawaiiTrainer
+from .trainer import CurriculumCallback, NaNDetectorCallback, KawaiiTrainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,8 +158,9 @@ def train():
     # Build collator
     collator = KawaiiDataCollator(tokenizer=tokenizer)
 
-    # Build curriculum callback (updates dataset progress for task warmup)
+    # Build callbacks
     curriculum_cb = CurriculumCallback(dataset=dataset)
+    nan_detector_cb = NaNDetectorCallback()
 
     # Build trainer
     trainer = KawaiiTrainer(
@@ -168,7 +169,7 @@ def train():
         train_dataset=dataset,
         data_collator=collator,
         tokenizer=tokenizer,
-        callbacks=[curriculum_cb],
+        callbacks=[curriculum_cb, nan_detector_cb],
         meme_lr=model_args.meme_lr,
         llm_lr=model_args.llm_lr,
         projector_lr=model_args.projector_lr,

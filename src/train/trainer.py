@@ -16,6 +16,32 @@ from .model import KawaiiLLMModel, RMSNorm
 logger = logging.getLogger(__name__)
 
 
+class NaNDetectorCallback(TrainerCallback):
+    """Detect which parameters become NaN after the first optimizer step."""
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if state.global_step != 1 or model is None:
+            return
+        m = model.module if hasattr(model, "module") else model
+        nan_by_component = {}
+        for name, param in m.named_parameters():
+            if not torch.isnan(param.data).any():
+                continue
+            component = name.split(".")[0]
+            if component not in nan_by_component:
+                nan_by_component[component] = []
+            nan_by_component[component].append(name)
+
+        if nan_by_component:
+            for comp, params in nan_by_component.items():
+                logger.error(
+                    "NaN after step 0 in [%s]: %d params, first 5: %s",
+                    comp, len(params), params[:5],
+                )
+        else:
+            logger.info("All parameters clean after step 0")
+
+
 class CurriculumCallback(TrainerCallback):
     """Updates current epoch on dataset for deterministic task rotation.
 
