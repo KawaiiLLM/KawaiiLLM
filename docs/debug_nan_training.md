@@ -203,8 +203,8 @@ prefix_attn[:, 0] = 1                         # Mixed
 
 ## 下一步
 
-1. **验证修复**：重新运行 `bash scripts/train_debug_no_gc.sh`，确认 GRAD_NaN hook 不再触发
-2. **恢复完整训练**：确认修复后，使用 `configs/train_8xa800.sh` 启动正式训练（含 GC）
+1. **验证 communication_data_type=fp32 修复**：重新运行 `bash scripts/train_debug_no_gc.sh`（8 卡），确认 `All parameters clean after step 0` 且 `grad_norm` 有限
+2. **恢复完整训练**：确认修复后，使用 `scripts/train_8xa800.sh` 启动正式训练（含 GC）
 3. **清理诊断代码**：训练稳定后删除 `_grad_hook_count`、debug logging 等（见下方清理清单）
 
 ---
@@ -294,7 +294,10 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 - `register_nan_gradient_hooks()`：参数级 NaN → 0 安全网，防止单个坏微批次毒化梯度累积
 - `attn_implementation` 参数：虽然 eager attention 已排除为根因，保留选项用于未来调试
 
-| (待定) | 残差嵌入 + NaN 梯度安全网 | 待验证 |
+| fe3004d | 残差嵌入：`projected += pad_embed_vec`，阻止 RMSNorm 梯度爆炸 | 梯度 hook 不再触发，但 8 卡仍 NaN（下一阶段） |
+| 9602b52 | 梯度安全网扩展：同时检查 isnan + isinf | 诊断工具就绪 |
+| f940fd9 | 单卡无 DS 诊断脚本 `train_debug_no_ds.sh` | 单卡 5 步完全正常，确认 allreduce 是根因 |
+| b50e1d5 | `communication_data_type=fp32`：allreduce 在 fp32 下进行 | **待 8 卡验证** |
 
 ---
 
@@ -324,6 +327,7 @@ projected = projected + pad_embed_vec  # pad_embed (~0.02) + projector (~0.003)
 - **Gradient Checkpointing**：不是 NaN 的根因（禁用后 NaN 仍在）
 - **Flash/Eager Attention**：不是 NaN 的根因（eager attention NaN 模式不变）
 - **NTP path 零嵌入**：已修复（pad embedding 替代 torch.zeros）
+- **单卡训练（无 allreduce）**：5 步完全正常，grad_norm 有限，loss 下降，确认根因在 DeepSpeed allreduce
 
 ---
 
@@ -360,6 +364,60 @@ bf16 参数梯度 matmul 溢出 → inf（不是 NaN）
 
 1. `src/train/model.py`：`register_nan_gradient_hooks()` 中 `_hook` 函数同时检查 `torch.isnan()` 和 `torch.isinf()`
 2. `src/train/trainer.py`：`NaNDetectorCallback.on_step_end` 同时检查权重中的 NaN 和 inf
+
+---
+
+### 阶段 11 — 根因确认：DeepSpeed bf16 allreduce 溢出（已修复）
+
+**输入**：Phase 10 修复后（commit `9602b52`），8 卡训练日志仍然崩溃——所有 404 个参数在 step 0 后变为 NaN/inf，但梯度 hook 无任何警告。
+
+**关键线索整理**：
+
+| 观察 | 含义 |
+|---|---|
+| Step 0 forward 干净（loss=2.5917，logits 有限） | 前向无问题 |
+| 梯度 hook（`register_nan_gradient_hooks`）**无任何警告** | 参数梯度在 hook 触发时是**有限值** |
+| step 0 后**所有 404 个参数**变为 NaN/inf | 损坏发生在 hook 触发**之后** |
+| 同样的日志在**全部 8 个 rank 上重复** | 损坏对称，指向 **allreduce** |
+
+**诊断实验**：单卡，去掉 DeepSpeed（`scripts/train_debug_no_ds.sh`）
+
+```
+All parameters clean after step 0
+{'loss': 2.603, 'grad_norm': 32.793, 'learning_rate': 0.0, 'epoch': 0.0}
+{'loss': 2.426, 'grad_norm': 11.402, 'learning_rate': 1e-05, ...}
+{'loss': 2.935, 'grad_norm': 24.097, ...}
+...（5 步全部正常）
+```
+
+**结论**：单卡（无 allreduce）训练完全正常 → 根因在 DeepSpeed 的 8 卡 allreduce 阶段。
+
+**根因：DeepSpeed ZeRO-2 bf16 allreduce 中间求和溢出**
+
+```
+1. 各卡 backward：参数梯度有限 → hook 触发，passthrough（无警告）
+2. DeepSpeed AllReduce（NCCL）：8 × large_grad 求和
+   → 中间和可能超过 bf16 上限（65504）→ 溢出为 inf
+3. DeepSpeed 梯度裁剪：
+   global_norm = sqrt(sum(inf^2)) = inf
+   scale = max_norm / inf = 1.0 / inf = 0.0
+   clipped_grad = inf × 0.0 = NaN  ← IEEE 754
+4. Warmup 阶段 lr ≈ 0：
+   w = w - 0 × NaN = w - NaN = NaN  ← 0 × NaN = NaN（IEEE 754）
+5. 全部 404 个参数 → NaN
+```
+
+**为什么单卡不溢出**：单卡 grad_norm ≈ 32.8，说明个别参数梯度元素可达数百量级（embedding 的稀疏梯度行，同一 token 多次出现时累积）。8 卡 allreduce 对这些元素求和后，可能超过 bf16 上限（65504 / 8 ≈ 8188 per GPU 即在溢出边界）。
+
+**修复**：`configs/ds_zero2.json` 增加一行：
+
+```json
+"communication_data_type": "fp32"
+```
+
+强制 NCCL allreduce 在 fp32 下进行，防止中间求和溢出，结果再转回 bf16 存入 `param.grad`。
+
+**提交**：`b50e1d5` — `fix(deepspeed): force fp32 gradient allreduce to prevent bf16 overflow`
 
 ---
 
