@@ -60,26 +60,20 @@ class KawaiiLLMModel(nn.Module):
         super().__init__()
 
         # Load MemE encoder.
-        # attn_implementation="eager" disables Flash Attention to avoid a known
-        # NaN issue: Flash Attention backward + gradient checkpointing (reentrant
-        # mode) can produce NaN gradients when the GC re-run recomputes Flash
-        # Attention's log_sum_exp tensors differently from the original forward.
         logger.info("Loading MemE from %s", meme_model_name_or_path)
         self.meme = AutoModel.from_pretrained(
             meme_model_name_or_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            attn_implementation="eager",
         )
         meme_hidden = self.meme.config.hidden_size
 
-        # Load LLM decoder (same eager-attention rationale as MemE above).
+        # Load LLM decoder.
         logger.info("Loading LLM from %s", llm_model_name_or_path)
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name_or_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            attn_implementation="eager",
         )
         llm_hidden = self.llm.config.hidden_size
 
