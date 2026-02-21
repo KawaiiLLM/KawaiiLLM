@@ -59,6 +59,8 @@ class GradNormCallback(TrainerCallback):
                         self._hooks.append(p.register_hook(make_hook(comp_name)))
 
     def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
         if state.global_step % args.logging_steps == 0:
             # Single .item() per component — 3 GPU→CPU syncs total per interval
             norms = {}
@@ -86,7 +88,7 @@ class NaNDetectorCallback(TrainerCallback):
     """Detect NaN/inf parameters after step 0."""
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if model is None:
+        if not state.is_world_process_zero or model is None:
             return
         m = model.module if hasattr(model, "module") else model
 
@@ -120,6 +122,8 @@ class TaskLossCallback(TrainerCallback):
     _TASK_NAMES = {0: "ntp", 1: "recon", 2: "cont"}
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
         if state.global_step % args.logging_steps != 0 or state.global_step == 0:
             return
         m = model.module if hasattr(model, "module") else model
