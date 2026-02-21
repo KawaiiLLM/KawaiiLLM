@@ -146,6 +146,25 @@ class KawaiiLLMModel(nn.Module):
         self._mem_end_token_id = token_ids["</mem>"]
         self._ae_token_id = token_ids["<AE>"]
         self._pad_token_id = token_ids["pad_token_id"]
+
+        # Cache ID tensors as non-persistent buffers — auto-tracks device
+        # with .to()/.cuda() but excluded from state_dict (derived values).
+        self.register_buffer(
+            "_mem_id_buf",
+            torch.tensor([self._mem_token_id], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_mem_end_id_buf",
+            torch.tensor([self._mem_end_token_id], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_pad_id_buf",
+            torch.tensor([self._pad_token_id], dtype=torch.long),
+            persistent=False,
+        )
+
         logger.info(
             "Special token IDs set: <mem>=%d, </mem>=%d, <AE>=%d, pad=%s",
             self._mem_token_id,
@@ -228,15 +247,9 @@ class KawaiiLLMModel(nn.Module):
         # Get text embeddings from MemE's embedding layer
         text_embeds = meme_embed(context_ids)  # [B, L, meme_hidden]
 
-        # Get <mem> and </mem> boundary token embeddings
-        mem_start_id = torch.tensor(
-            [self._mem_token_id], device=device, dtype=torch.long
-        )
-        mem_end_id = torch.tensor(
-            [self._mem_end_token_id], device=device, dtype=torch.long
-        )
-        mem_start_emb = meme_embed(mem_start_id)  # [1, meme_hidden]
-        mem_end_emb = meme_embed(mem_end_id)  # [1, meme_hidden]
+        # Get <mem> and </mem> boundary token embeddings (using cached buffers)
+        mem_start_emb = meme_embed(self._mem_id_buf)      # [1, meme_hidden]
+        mem_end_emb = meme_embed(self._mem_end_id_buf)    # [1, meme_hidden]
         # Expand to batch: [B, 1, meme_hidden]
         mem_start_emb = mem_start_emb.unsqueeze(0).expand(B, -1, -1)
         mem_end_emb = mem_end_emb.unsqueeze(0).expand(B, -1, -1)
@@ -370,9 +383,13 @@ class KawaiiLLMModel(nn.Module):
                 # as a masked prefix in the LLM input.  Backward then
                 # naturally flows LLM → prefix → projector → MemE —
                 # matching the non-NTP path order exactly.
-                dummy_mem = self.encode_context(
-                    context_ids[:1], context_attention_mask[:1], 1,
+                # Explicit single-token dummy: guarantees MemE processes exactly
+                # 4 tokens (pad + <mem> + Q + </mem>) regardless of batch content.
+                dummy_ctx = self._pad_id_buf.view(1, 1)
+                dummy_mask = torch.ones(
+                    1, 1, device=device, dtype=context_attention_mask.dtype,
                 )
+                dummy_mem = self.encode_context(dummy_ctx, dummy_mask, 1)
                 dummy_proj = self.projector(dummy_mem)  # [1, 1, llm_hidden]
 
                 # 1-token prefix with mask=1, connected to dummy_proj for
@@ -383,10 +400,7 @@ class KawaiiLLMModel(nn.Module):
                 # Use pad token embedding instead of zeros.  Zero embeddings
                 # cause RMSNorm backward to amplify gradients by 1/sqrt(eps)
                 # ≈ 1000× per layer, overflowing to inf/NaN in bfloat16.
-                pad_id = torch.full(
-                    (1, 1), self._pad_token_id, device=device, dtype=torch.long,
-                )
-                prefix_embeds = llm_embed(pad_id).detach().expand(B, -1, -1)
+                prefix_embeds = llm_embed(self._pad_id_buf.view(1, 1)).detach().expand(B, -1, -1)
                 prefix_embeds = prefix_embeds + (dummy_proj.sum() * 0.0)
                 prefix_mask = attention_mask.new_ones(B, 1)
 
@@ -441,59 +455,44 @@ class KawaiiLLMModel(nn.Module):
 
         # Pad token embedding for left-padded prefix positions and
         # residual base for projected tokens (prevents RMSNorm gradient explosion).
-        pad_id = torch.full(
-            (1,), self._pad_token_id, device=device, dtype=torch.long,
-        )
-        pad_embed_vec = llm_embed(pad_id).detach().squeeze(0)  # [llm_hidden]
+        pad_embed_vec = llm_embed(self._pad_id_buf).detach().squeeze(0)  # [llm_hidden]
 
         # Residual embedding: projector output starts near-zero (std ≈ 0.003),
         # causing RMSNorm backward to amplify gradients ~333× vs ~50× for normal
         # embeddings.  Adding pad embedding as constant base bounds amplification.
         projected = projected + pad_embed_vec.unsqueeze(0).unsqueeze(0)
 
-        # Build per-sample left-padded prefix
-        mem_start_id = torch.tensor(
-            [self._mem_token_id], device=device, dtype=torch.long
-        )
-        mem_end_id = torch.tensor(
-            [self._mem_end_token_id], device=device, dtype=torch.long
-        )
-        mem_start_emb = llm_embed(mem_start_id).squeeze(0)  # [llm_hidden]
-        mem_end_emb = llm_embed(mem_end_id).squeeze(0)  # [llm_hidden]
+        # Build per-sample left-padded prefix (using cached ID buffers)
+        mem_start_emb = llm_embed(self._mem_id_buf).squeeze(0)      # [llm_hidden]
+        mem_end_emb = llm_embed(self._mem_end_id_buf).squeeze(0)    # [llm_hidden]
 
         max_prefix_len = max_n_mem + 2  # <mem>(1) + max_n_mem + </mem>(1)
-        prefix_embeds_list = []
-        prefix_mask_list = []
 
-        for i in range(B):
-            ni = n_mem[i].item()
+        # --- Vectorized prefix construction (no per-sample torch.cat/clone) ---
+        # Initialize all positions with pad embedding (one allocation)
+        prefix_embeds = pad_embed_vec.view(1, 1, -1).expand(B, max_prefix_len, -1).contiguous()
 
-            if ni == 0:
-                # NTP sample in mixed batch: entire prefix is masked padding
-                prefix_embeds_list.append(
-                    pad_embed_vec.unsqueeze(0).expand(max_prefix_len, -1).clone()
-                )
-                prefix_mask_list.append(
-                    torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
-                )
-            else:
-                pad_len = max_n_mem - ni
-                parts = []
-                if pad_len > 0:
-                    parts.append(
-                        pad_embed_vec.unsqueeze(0).expand(pad_len, -1).clone()
-                    )
-                parts.append(mem_start_emb.unsqueeze(0))   # [1, llm_hidden]
-                parts.append(projected[i, :ni])             # [ni, llm_hidden]
-                parts.append(mem_end_emb.unsqueeze(0))      # [1, llm_hidden]
-                prefix_embeds_list.append(torch.cat(parts, dim=0))
+        non_ntp_idx = non_ntp_mask.nonzero(as_tuple=True)[0]
 
-                mask = torch.zeros(max_prefix_len, device=device, dtype=attention_mask.dtype)
-                mask[pad_len:] = 1
-                prefix_mask_list.append(mask)
+        if non_ntp_idx.numel() > 0:
+            pad_lens = max_n_mem - n_mem  # [B], per-sample left-pad length
 
-        prefix_embeds = torch.stack(prefix_embeds_list)  # [B, max_prefix_len, llm_hidden]
-        prefix_attn = torch.stack(prefix_mask_list)      # [B, max_prefix_len]
+            # Place <mem> boundary at position pad_lens[i] for each non-NTP sample
+            prefix_embeds[non_ntp_idx, pad_lens[non_ntp_idx]] = mem_start_emb
+
+            # Place </mem> boundary at position max_n_mem+1 (same for all non-NTP)
+            prefix_embeds[non_ntp_idx, max_n_mem + 1] = mem_end_emb
+
+            # Place projected tokens (minimal loop: just slice assignment, no allocations)
+            for i in non_ntp_idx:
+                ni = n_mem[i].item()
+                start = pad_lens[i].item() + 1
+                prefix_embeds[i, start:start + ni] = projected[i, :ni]
+
+        # Build attention mask vectorized: mask[i,j] = 1 iff j >= pad_lens[i] AND non-NTP
+        pad_lens_all = torch.where(non_ntp_mask, max_n_mem - n_mem, max_prefix_len)  # NTP -> all masked
+        positions = torch.arange(max_prefix_len, device=device).unsqueeze(0)  # [1, P]
+        prefix_attn = (positions >= pad_lens_all.unsqueeze(1)).to(attention_mask.dtype)
 
         # Ensure position 0 of the prefix always has mask=1.  Without this,
         # left-padded positions (mask=0) have NO valid attention keys (causal

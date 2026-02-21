@@ -1,6 +1,8 @@
 #!/bin/bash
 # KawaiiLLM training launch script for 8x A800 80GB
 # Effective batch size: 2 * 8 * 8 = 128
+# Note: --learning_rate is the scheduler base reference only;
+# all param groups use explicit LRs (projector_lr, meme_lr, llm_lr).
 
 set -euo pipefail
 
@@ -27,16 +29,17 @@ deepspeed --num_gpus 8 --module src.train.train \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 8 \
   --num_train_epochs 3 \
-  --learning_rate 2e-5 \
+  --learning_rate 1e-5 \
   --warmup_ratio 0.03 \
   --lr_scheduler_type cosine \
   --weight_decay 0.01 \
+  --tf32 True \
   --gradient_checkpointing True \
   --save_strategy steps \
   --save_steps 2000 \
   --save_total_limit 3 \
   --logging_steps 10 \
-  --dataloader_num_workers 32 \
+  --dataloader_num_workers 8 \
   --logging_dir /lpai/output/tensorboard \
   --report_to tensorboard \
   --run_name kawaii_v1
