@@ -27,7 +27,7 @@ class GradNormCallback(TrainerCallback):
 
     COMPONENTS = ("projector", "meme", "llm")
 
-    def __init__(self, monitor_steps: int = 100):
+    def __init__(self, monitor_steps: int = 10):
         self._monitor_steps = monitor_steps
         # GPU tensors — no .item() inside hooks, avoiding CPU-GPU sync per parameter.
         # Synced only once per monitor interval (3 .item() calls total).
