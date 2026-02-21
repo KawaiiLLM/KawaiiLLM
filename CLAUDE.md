@@ -55,7 +55,7 @@ python src/merge_and_shuffle.py \
 
 ### Architecture
 - **MemE** (Qwen3-Embedding-4B): encoder, hidden_size=2560, 36 layers
-- **Projector**: Linear(2560->4096) -> GELU -> Linear(4096->4096), plus learnable `mem_embeddings(128, 2560)`
+- **Projector**: RMSNorm(2560) -> Linear(2560->10240) -> GELU -> Linear(10240->4096), plus learnable `mem_embeddings(128, 2560)`
 - **LLM** (Qwen3-8B-Base): decoder, hidden_size=4096, 36 layers
 
 ### File Structure
@@ -66,7 +66,7 @@ src/train/
 ├── model.py           # KawaiiLLMModel (MemE + Projector + LLM)
 ├── dataset.py         # KawaiiDataset with byte-offset access + deterministic task rotation
 ├── collator.py        # Left-pad context, right-pad target, collect per-sample n_mem
-├── trainer.py         # KawaiiTrainer + CurriculumCallback (epoch tracking)
+├── trainer.py         # KawaiiTrainer + callbacks (Curriculum, GradNorm, TaskLoss, NaN)
 └── train.py           # Entry point
 configs/
 ├── ds_zero2.json      # DeepSpeed ZeRO-2 config for 8x A800
@@ -93,12 +93,14 @@ bash configs/train_8xa800.sh
 Edit paths in `train_8xa800.sh` before running (`meme_model_name_or_path`, `llm_model_name_or_path`).
 
 ### Key Design Decisions
-- **2/3-task deterministic rotation**: Entries with next chunk: 3-task (NTP, reconstruction, continuation) via `(idx + epoch + epoch//3) % 3`. Entries without: 2-task (NTP, reconstruction) via `(idx + epoch) % 2`. No fallback logic.
-- **Per-component LR**: projector+mem_embeddings ~1e-3, MemE ~1e-6, LLM ~1e-6.
-- **MemE frozen by default**: runs under `torch.no_grad()`, no gradient checkpointing needed.
+- **Predecessor-based 2-task rotation**: Entries with a predecessor chunk: 2-task (reconstruction, continuation) via `(idx + epoch) % 2`. Entries without a predecessor: 2-task (NTP, reconstruction) via `(idx + epoch) % 2`. Continuation direction: prev_chunk → MemE context, current_chunk → LLM target.
+- **Per-component LR**: projector+mem_embeddings ~5e-4, MemE ~1e-5, LLM ~1e-5.
+- **MemE not frozen by default**: `freeze_meme=False` in launch script.
+- **Flash Attention 2**: enabled for both MemE and LLM via `--attn_implementation flash_attention_2`.
 - **Context left-padded** (MemE padding_side='left'), target right-padded (standard causal LM).
 - **Checkpoints saved as**: `meme/`, `projector/` (projector.pt + mem_embeddings.pt), `llm/` subdirs.
 - **Labels**: `cat([IGNORE * n_mem, target_labels])` — HF's internal shift handles alignment correctly.
+- **Monitoring**: `--monitor_steps` controls per-component grad norm and per-task loss logging interval (default 10). GradNormCallback reports energy percentages (squared norm fractions) per optimizer step. TaskLossCallback reports mean loss for NTP/reconstruction/continuation tasks.
 
 ### C3 Reference (for context)
 Adapted from `C3-Context-Cascade-Compression`. Key differences:
