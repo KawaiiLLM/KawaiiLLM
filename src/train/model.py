@@ -229,8 +229,14 @@ class KawaiiLLMModel(nn.Module):
         Called after each forward pass (training only); TaskLossCallback reads
         and clears _task_accum every logging_steps optimizer steps.
         """
+        # Skip if enough samples already collected for this logging window.
+        # Avoids running a full CE pass on every micro-batch; 32 samples give
+        # stable per-task averages across logging_steps=10 / grad_accum=8.
+        if sum(len(v) for v in self._task_accum.values()) >= 32:
+            return
+
         B, L, V = logits.shape
-        shift_logits = logits[:, :-1].float().contiguous()   # [B, L-1, V]
+        shift_logits = logits[:, :-1].contiguous()            # [B, L-1, V] — keep bf16
         shift_labels = combined_labels[:, 1:].contiguous()   # [B, L-1]
 
         per_token = F.cross_entropy(

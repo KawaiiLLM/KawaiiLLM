@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from transformers import Trainer, TrainerCallback
@@ -28,7 +28,9 @@ class GradNormCallback(TrainerCallback):
     COMPONENTS = ("projector", "meme", "llm")
 
     def __init__(self):
-        self._sq_norms: Dict[str, float] = {k: 0.0 for k in self.COMPONENTS}
+        # GPU tensors — no .item() inside hooks, avoiding CPU-GPU sync per parameter.
+        # Synced only once per logging interval (3 .item() calls total).
+        self._gpu_sq: Dict[str, Optional[torch.Tensor]] = {k: None for k in self.COMPONENTS}
         self._hooks: list = []
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
@@ -48,16 +50,23 @@ class GradNormCallback(TrainerCallback):
                         def make_hook(name):
                             def hook(grad):
                                 if grad is not None:
-                                    self._sq_norms[name] += (
-                                        grad.detach().float().norm(2).item() ** 2
-                                    )
+                                    sq = grad.detach().float().norm(2).pow(2)
+                                    if self._gpu_sq[name] is None:
+                                        self._gpu_sq[name] = sq
+                                    else:
+                                        self._gpu_sq[name] = self._gpu_sq[name] + sq
                             return hook
                         self._hooks.append(p.register_hook(make_hook(comp_name)))
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % args.logging_steps == 0:
-            norms = {k: v ** 0.5 for k, v in self._sq_norms.items()}
-            total = sum(v ** 2 for v in norms.values()) ** 0.5 or 1.0
+            # Single .item() per component — 3 GPU→CPU syncs total per interval
+            norms = {}
+            for k, sq_gpu in self._gpu_sq.items():
+                norms[k] = sq_gpu.item() ** 0.5 if sq_gpu is not None else 0.0
+                self._gpu_sq[k] = None  # reset
+
+            total = (sum(v ** 2 for v in norms.values()) ** 0.5) or 1.0
             logger.info(
                 "Step %d component grad norms — "
                 "projector: %.3e (%.1f%%)  meme: %.3e (%.1f%%)  llm: %.3e (%.1f%%)",
@@ -66,8 +75,6 @@ class GradNormCallback(TrainerCallback):
                 norms["meme"],      100 * norms["meme"]      / total,
                 norms["llm"],       100 * norms["llm"]       / total,
             )
-            for k in self._sq_norms:
-                self._sq_norms[k] = 0.0
 
     def on_train_end(self, args, state, control, **kwargs):
         for h in self._hooks:
