@@ -22,6 +22,7 @@ from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,9 @@ class KawaiiLLMModel(nn.Module):
         self._ae_token_id: Optional[int] = None
         self._pad_token_id: Optional[int] = None
 
+        # Accumulator for per-task loss monitoring (read and cleared by TaskLossCallback)
+        self._task_accum: Dict[int, list] = {0: [], 1: [], 2: []}
+
         logger.info(
             "KawaiiLLM initialized: meme_hidden=%d, llm_hidden=%d, "
             "num_mem_tokens=%d, projector_expansion=%dx",
@@ -210,6 +214,48 @@ class KawaiiLLMModel(nn.Module):
         """Required when gradient checkpointing is used with frozen params."""
         self.meme.enable_input_require_grads()
         self.llm.enable_input_require_grads()
+
+    @torch.no_grad()
+    def _store_task_info(
+        self,
+        logits: torch.Tensor,
+        combined_labels: torch.LongTensor,
+        n_mem: torch.LongTensor,
+        input_ids: torch.LongTensor,
+    ) -> None:
+        """Compute per-sample losses and accumulate by task for monitoring.
+
+        Task IDs: 0 = NTP, 1 = Reconstruction, 2 = Continuation.
+        Called after each forward pass (training only); TaskLossCallback reads
+        and clears _task_accum every logging_steps optimizer steps.
+        """
+        B, L, V = logits.shape
+        shift_logits = logits[:, :-1].float().contiguous()   # [B, L-1, V]
+        shift_labels = combined_labels[:, 1:].contiguous()   # [B, L-1]
+
+        per_token = F.cross_entropy(
+            shift_logits.view(-1, V),
+            shift_labels.view(-1),
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
+        ).view(B, -1)  # [B, L-1]
+
+        valid = shift_labels != IGNORE_INDEX
+        per_sample = (per_token * valid.float()).sum(-1) / valid.float().sum(-1).clamp(min=1)
+
+        # Classify task per sample
+        task_ids = n_mem.new_zeros(B)                               # 0 = NTP
+        non_ntp = n_mem > 0
+        task_ids[non_ntp] = 2                                       # 2 = Continuation
+        ae_mask = non_ntp & (input_ids[:, 0] == self._ae_token_id)
+        task_ids[ae_mask] = 1                                       # 1 = Reconstruction
+
+        losses_cpu = per_sample.cpu()
+        tasks_cpu = task_ids.cpu()
+        for tid in range(3):
+            mask = tasks_cpu == tid
+            if mask.any():
+                self._task_accum[tid].extend(losses_cpu[mask].tolist())
 
     def encode_context(
         self,
@@ -415,12 +461,14 @@ class KawaiiLLMModel(nn.Module):
                 position_ids = combined_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(combined_mask == 0, 0)
 
-                return self.llm(
+                ntp_outputs = self.llm(
                     inputs_embeds=combined_embeds,
                     attention_mask=combined_mask,
                     labels=combined_labels,
                     position_ids=position_ids,
                 )
+                self._store_task_info(ntp_outputs.logits, combined_labels, n_mem, input_ids)
+                return ntp_outputs
 
             # Eval: no gradient sync needed, skip MemE entirely
             position_ids = attention_mask.long().cumsum(-1) - 1
@@ -535,6 +583,7 @@ class KawaiiLLMModel(nn.Module):
             position_ids=position_ids,
         )
 
+        self._store_task_info(outputs.logits, llm_labels, n_mem, input_ids)
         return outputs
 
     def save_checkpoint(self, output_dir: str):

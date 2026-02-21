@@ -16,6 +16,65 @@ from .model import KawaiiLLMModel, RMSNorm
 logger = logging.getLogger(__name__)
 
 
+class GradNormCallback(TrainerCallback):
+    """Log per-component gradient norms every logging_steps optimizer steps.
+
+    Uses gradient hooks that fire during backward (before DeepSpeed's
+    reduce-scatter), so norms reflect the local pre-reduction gradients.
+    For relative comparison across components this is correct; absolute
+    values may differ slightly from the global grad_norm logged by HF Trainer.
+    """
+
+    COMPONENTS = ("projector", "meme", "llm")
+
+    def __init__(self):
+        self._sq_norms: Dict[str, float] = {k: 0.0 for k in self.COMPONENTS}
+        self._hooks: list = []
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        m = model.module if hasattr(model, "module") else model
+        if not isinstance(m, KawaiiLLMModel):
+            return
+
+        mapping = {
+            "projector": [m.projector, m.mem_embeddings],
+            "meme": [m.meme],
+            "llm": [m.llm],
+        }
+        for comp_name, modules in mapping.items():
+            for mod in modules:
+                for p in mod.parameters():
+                    if p.requires_grad:
+                        def make_hook(name):
+                            def hook(grad):
+                                if grad is not None:
+                                    self._sq_norms[name] += (
+                                        grad.detach().float().norm(2).item() ** 2
+                                    )
+                            return hook
+                        self._hooks.append(p.register_hook(make_hook(comp_name)))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % args.logging_steps == 0:
+            norms = {k: v ** 0.5 for k, v in self._sq_norms.items()}
+            total = sum(v ** 2 for v in norms.values()) ** 0.5 or 1.0
+            logger.info(
+                "Step %d component grad norms — "
+                "projector: %.3e (%.1f%%)  meme: %.3e (%.1f%%)  llm: %.3e (%.1f%%)",
+                state.global_step,
+                norms["projector"], 100 * norms["projector"] / total,
+                norms["meme"],      100 * norms["meme"]      / total,
+                norms["llm"],       100 * norms["llm"]       / total,
+            )
+            for k in self._sq_norms:
+                self._sq_norms[k] = 0.0
+
+    def on_train_end(self, args, state, control, **kwargs):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
 class NaNDetectorCallback(TrainerCallback):
     """Detect NaN/inf parameters after step 0."""
 
@@ -41,6 +100,37 @@ class NaNDetectorCallback(TrainerCallback):
                     )
             else:
                 logger.info("All parameters clean after step 0")
+
+
+class TaskLossCallback(TrainerCallback):
+    """Log per-task mean losses from model._task_accum every logging_steps.
+
+    task_accum is filled by KawaiiLLMModel._store_task_info() after every
+    training forward pass (including gradient-accumulation micro-batches),
+    so each logging interval covers all micro-batches in that window.
+    """
+
+    _TASK_NAMES = {0: "ntp", 1: "recon", 2: "cont"}
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if state.global_step % args.logging_steps != 0 or state.global_step == 0:
+            return
+        m = model.module if hasattr(model, "module") else model
+        if not isinstance(m, KawaiiLLMModel) or not hasattr(m, "_task_accum"):
+            return
+
+        parts = []
+        for tid, name in self._TASK_NAMES.items():
+            vals = m._task_accum.get(tid, [])
+            if vals:
+                avg = sum(vals) / len(vals)
+                parts.append(f"{name}: {avg:.4f} (n={len(vals)})")
+            m._task_accum[tid] = []  # clear after reading
+
+        if parts:
+            logger.info(
+                "Step %d task losses — %s", state.global_step, "  ".join(parts)
+            )
 
 
 class CurriculumCallback(TrainerCallback):
