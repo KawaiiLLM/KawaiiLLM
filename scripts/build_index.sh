@@ -15,5 +15,5 @@ python -m src.train.build_index \
     data/code/formatted \
   --output_path data/train_index.json \
   --upsample moegirl:3 \
-  --merge_max_tokens 3500 \
+  --merge_max_tokens 4000 \
   --merge_short_threshold 2048
