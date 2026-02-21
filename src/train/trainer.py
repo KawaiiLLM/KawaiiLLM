@@ -27,9 +27,10 @@ class GradNormCallback(TrainerCallback):
 
     COMPONENTS = ("projector", "meme", "llm")
 
-    def __init__(self):
+    def __init__(self, monitor_steps: int = 100):
+        self._monitor_steps = monitor_steps
         # GPU tensors — no .item() inside hooks, avoiding CPU-GPU sync per parameter.
-        # Synced only once per logging interval (3 .item() calls total).
+        # Synced only once per monitor interval (3 .item() calls total).
         self._gpu_sq: Dict[str, Optional[torch.Tensor]] = {k: None for k in self.COMPONENTS}
         self._hooks: list = []
 
@@ -61,7 +62,7 @@ class GradNormCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
             return
-        if state.global_step % args.logging_steps == 0:
+        if state.global_step % self._monitor_steps == 0 and state.global_step > 0:
             # Single .item() per component — 3 GPU→CPU syncs total per interval
             norms = {}
             for k, sq_gpu in self._gpu_sq.items():
@@ -123,10 +124,13 @@ class TaskLossCallback(TrainerCallback):
 
     _TASK_NAMES = {0: "ntp", 1: "recon", 2: "cont"}
 
+    def __init__(self, monitor_steps: int = 100):
+        self._monitor_steps = monitor_steps
+
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if not state.is_world_process_zero:
             return
-        if state.global_step % args.logging_steps != 0 or state.global_step == 0:
+        if state.global_step % self._monitor_steps != 0 or state.global_step == 0:
             return
         m = model.module if hasattr(model, "module") else model
         if not isinstance(m, KawaiiLLMModel) or not hasattr(m, "_task_accum"):
