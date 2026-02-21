@@ -63,10 +63,15 @@ class KawaiiLLMModel(nn.Module):
 
         # Load MemE encoder.
         logger.info("Loading MemE from %s", meme_model_name_or_path)
-        self.meme = AutoModel.from_pretrained(
-            meme_model_name_or_path,
+        meme_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
+        )
+        if attn_implementation:
+            meme_kwargs["attn_implementation"] = attn_implementation
+        self.meme = AutoModel.from_pretrained(
+            meme_model_name_or_path,
+            **meme_kwargs,
         )
         meme_hidden = self.meme.config.hidden_size
 
@@ -78,7 +83,7 @@ class KawaiiLLMModel(nn.Module):
         )
         if attn_implementation:
             llm_kwargs["attn_implementation"] = attn_implementation
-            logger.info("LLM attention implementation: %s", attn_implementation)
+        logger.info("Attention implementation: %s", attn_implementation or "default")
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_model_name_or_path, **llm_kwargs,
         )

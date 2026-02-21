@@ -35,6 +35,10 @@ class GradNormCallback(TrainerCallback):
         self._hooks: list = []
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        # Only register hooks on rank 0: other ranks' gradients are local
+        # pre-reduction values that we never read, so skip the accumulation cost.
+        if not state.is_world_process_zero:
+            return
         m = model.module if hasattr(model, "module") else model
         if not isinstance(m, KawaiiLLMModel):
             return
@@ -62,13 +66,15 @@ class GradNormCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
             return
-        if state.global_step % self._monitor_steps == 0 and state.global_step > 0:
-            # Single .item() per component — 3 GPU→CPU syncs total per interval
-            norms = {}
-            for k, sq_gpu in self._gpu_sq.items():
-                norms[k] = sq_gpu.item() ** 0.5 if sq_gpu is not None else 0.0
-                self._gpu_sq[k] = None  # reset
+        # Read and reset every optimizer step so the reported norm reflects
+        # only the gradient_accumulation_steps micro-batches of that step,
+        # not a growing cumulative sum across the entire monitoring window.
+        norms = {}
+        for k, sq_gpu in self._gpu_sq.items():
+            norms[k] = sq_gpu.item() ** 0.5 if sq_gpu is not None else 0.0
+            self._gpu_sq[k] = None  # reset for next optimizer step
 
+        if state.global_step % self._monitor_steps == 0 and state.global_step > 0:
             # Use squared norms (energy) for percentages so they sum to 100%
             sq = {k: v ** 2 for k, v in norms.items()}
             total_sq = sum(sq.values()) or 1.0

@@ -169,8 +169,8 @@ def train():
     # Build callbacks
     curriculum_cb = CurriculumCallback(dataset=dataset)
     nan_detector_cb = NaNDetectorCallback()
-    grad_norm_cb = GradNormCallback(monitor_steps=100)
-    task_loss_cb = TaskLossCallback(monitor_steps=100)
+    grad_norm_cb = GradNormCallback(monitor_steps=10)
+    task_loss_cb = TaskLossCallback(monitor_steps=10)
 
     # Build trainer
     trainer = KawaiiTrainer(

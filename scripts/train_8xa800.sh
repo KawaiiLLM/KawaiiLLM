@@ -21,6 +21,7 @@ deepspeed --num_gpus 8 --module src.train.train \
   --index_path data/train_index.json \
   --output_dir /mnt/volumes/ss-sai-bd-ga/zhaoqixuan/output/kawaii_v1 \
   --num_mem_tokens 128 \
+  --attn_implementation flash_attention_2 \
   --freeze_meme False \
   --projector_lr 5e-4 \
   --meme_lr 1e-5 \
