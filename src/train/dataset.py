@@ -3,16 +3,16 @@
 Three training tasks:
     1. NTP (Next Token Prediction): pure language modeling, no MemE involvement.
     2. Reconstruction (AE): context -> MemE -> latent -> LLM (<AE> signal) -> same text.
-    3. Continuation (AR): split_x -> MemE -> latent -> LLM -> split_{x+1}.
+    3. Continuation (AR): prev_chunk -> MemE -> latent -> LLM -> current_chunk.
 
-Task assignment (2/3-task rotation):
-    - Entries WITH a next chunk (continuation pair exists): 3-task rotation
-      over NTP, reconstruction, continuation.
-      Formula: task_idx = (idx + epoch + epoch // 3) % 3
-    - Entries WITHOUT a next chunk: 2-task rotation over NTP, reconstruction.
-      Formula: task_idx = (idx + epoch) % 2
-    - This ensures continuation is only assigned to samples that can execute it,
-      eliminating all fallback logic.
+Task assignment (predecessor-based 2-task rotation):
+    - Entries WITH a predecessor chunk: 2-task rotation over reconstruction,
+      continuation.  Formula: task_idx = (idx + epoch) % 2
+    - Entries WITHOUT a predecessor chunk: 2-task rotation over NTP,
+      reconstruction.  Formula: task_idx = (idx + epoch) % 2
+    - Continuation uses the predecessor as MemE context and the current chunk
+      as LLM target, matching the inference scenario where compressed history
+      is fed to the LLM to generate the next response.
 
 Per-sample n_mem:
     - NTP: n_mem = 0 (no MemE involvement).
@@ -21,18 +21,18 @@ Per-sample n_mem:
 EOS policy:
     EOS is added only when the text genuinely ends. Merged entries (artificial
     \\n\\n joins) never get EOS. Reconstruction always gets EOS on non-merged
-    entries (complete text boundary). NTP and continuation respect has_next.
+    entries (complete text boundary). NTP and continuation check has_next.
 
-    NTP:
+    NTP (only first-of-document chunks):
         merged entry             -> no EOS  (artificial boundary)
         non-merged, has next     -> no EOS  (text continues)
         non-merged, no next      -> EOS     (document ends)
     Reconstruction:
         merged entry             -> no EOS  (artificial boundary)
         non-merged               -> EOS     (complete reconstruction)
-    Continuation (only non-merged with next chunk):
-        target has next chunk    -> no EOS  (text continues)
-        target is last chunk     -> EOS     (document ends)
+    Continuation (current chunk is LLM target):
+        current has next chunk   -> no EOS  (text continues)
+        current is last chunk    -> EOS     (document ends)
 
 Merged chunks:
     - Short orphan entries merged by build_index.py have a "parts" field
@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
-TASK_TYPES_3 = ["ntp", "reconstruction", "continuation"]
-TASK_TYPES_2 = ["ntp", "reconstruction"]
+TASK_TYPES_NO_PREV = ["ntp", "reconstruction"]
+TASK_TYPES_HAS_PREV = ["reconstruction", "continuation"]
 
 
 class KawaiiDataset(Dataset):
@@ -82,13 +82,14 @@ class KawaiiDataset(Dataset):
         # <AE> token ID for reconstruction task signal
         self._ae_token_id = tokenizer.convert_tokens_to_ids("<AE>")
 
-        # Build map: source_idx -> target_idx for continuation pairs
-        self._continuation_map: Dict[int, int] = {}
+        # Build map: target_idx -> source_idx (predecessor lookup for continuation)
+        self._prev_map: Dict[int, int] = {}
         for src_idx, tgt_idx in self.continuation_pairs:
-            self._continuation_map[src_idx] = tgt_idx
+            self._prev_map[tgt_idx] = src_idx
 
-        # Set of entries that have a next chunk (eligible for 3-task rotation)
-        self._has_next: set = set(self._continuation_map.keys())
+        # Sets for task assignment and EOS determination
+        self._has_prev: set = set(self._prev_map.keys())
+        self._has_next: set = {src for src, _ in self.continuation_pairs}
 
         # Current epoch for deterministic task rotation (updated by callback)
         self._current_epoch = 0
@@ -96,13 +97,13 @@ class KawaiiDataset(Dataset):
         # File handle cache (per-worker, safe with DataLoader fork)
         self._file_handles: Dict[str, object] = {}
 
-        n_3task = len(self._has_next)
-        n_2task = len(self.entries) - n_3task
+        n_has_prev = len(self._has_prev)
+        n_no_prev = len(self.entries) - n_has_prev
         n_merged = sum(1 for e in self.entries if "parts" in e)
         logger.info(
-            "Dataset: %d entries (%d 3-task, %d 2-task, %d merged), "
-            "%d continuation pairs, <AE> id=%d, num_mem_tokens=%d",
-            len(self.entries), n_3task, n_2task, n_merged,
+            "Dataset: %d entries (%d has-prev recon/cont, %d no-prev NTP/recon, "
+            "%d merged), %d continuation pairs, <AE> id=%d, num_mem_tokens=%d",
+            len(self.entries), n_has_prev, n_no_prev, n_merged,
             len(self.continuation_pairs),
             self._ae_token_id,
             num_mem_tokens,
@@ -165,22 +166,21 @@ class KawaiiDataset(Dataset):
         return "parts" in self.entries[idx]
 
     def _get_task_type(self, idx: int) -> str:
-        """Deterministic task assignment based on sample index and epoch.
+        """Deterministic task assignment based on predecessor availability.
 
-        Entries with a next chunk: 3-task rotation (NTP, reconstruction,
-        continuation). Each sample trains with each task exactly once per
-        3-epoch cycle. The epoch // 3 shift varies starting task across cycles.
+        Entries with a predecessor: 2-task rotation (reconstruction,
+        continuation). Each sample alternates between the two every epoch.
 
-        Entries without a next chunk: 2-task rotation (NTP, reconstruction).
-        Each sample alternates between the two tasks every epoch.
+        Entries without a predecessor: 2-task rotation (NTP, reconstruction).
+        Each sample alternates between the two every epoch.
         """
         epoch = self._current_epoch
-        if idx in self._has_next:
-            task_idx = (idx + epoch + epoch // 3) % 3
-            return TASK_TYPES_3[task_idx]
+        if idx in self._has_prev:
+            task_idx = (idx + epoch) % 2
+            return TASK_TYPES_HAS_PREV[task_idx]
         else:
             task_idx = (idx + epoch) % 2
-            return TASK_TYPES_2[task_idx]
+            return TASK_TYPES_NO_PREV[task_idx]
 
     def _sample_n_mem(self, task_type: str) -> int:
         """Sample n_mem based on task type.
@@ -199,22 +199,17 @@ class KawaiiDataset(Dataset):
         - NTP non-merged, has next: no EOS (document continues).
         - NTP non-merged, no next: EOS (document ends).
         - Reconstruction non-merged: always EOS (complete reconstruction).
-        - Continuation target has next: no EOS (text continues).
-        - Continuation target is last: EOS (document ends).
+        - Continuation: current chunk is LLM target. EOS if document ends here.
         """
         if self._is_merged(idx):
             return False
         if task_type == "reconstruction":
-            # Reconstruction always needs EOS: the model should learn to
-            # reconstruct the complete text from compressed memory.
             return True
         if task_type == "ntp":
-            # EOS only if this entry is a genuine document end
             return idx not in self._has_next
         if task_type == "continuation":
-            # EOS depends on whether the TARGET chunk has further continuation
-            tgt_idx = self._continuation_map[idx]
-            return tgt_idx not in self._continuation_map
+            # Current chunk is the LLM target; EOS if document ends here
+            return idx not in self._has_next
         raise ValueError(f"Unknown task type: {task_type}")
 
     def _build_ntp_sample(self, text: str, add_eos: bool) -> dict:
@@ -249,7 +244,7 @@ class KawaiiDataset(Dataset):
 
         For NTP: pure language modeling, no MemE, n_mem=0.
         For reconstruction: input_ids starts with <AE> token as task signal.
-        For continuation: uses real next chunk as target.
+        For continuation: predecessor -> MemE context, current chunk -> LLM target.
 
         Returns:
             dict with:
@@ -267,12 +262,12 @@ class KawaiiDataset(Dataset):
         if task_type == "ntp":
             return self._build_ntp_sample(text, add_eos=add_eos)
 
-        # --- Continuation path (always has real next chunk) ---
+        # --- Continuation path (predecessor -> MemE, current -> LLM) ---
         if task_type == "continuation":
-            target_idx = self._continuation_map[idx]
-            target_record = self._read_entry(target_idx)
-            context_text = text
-            target_text = target_record.get("text", "")
+            prev_idx = self._prev_map[idx]
+            prev_record = self._read_entry(prev_idx)
+            context_text = prev_record.get("text", "")
+            target_text = text
 
         # --- Reconstruction path ---
         elif task_type == "reconstruction":
