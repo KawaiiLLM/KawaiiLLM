@@ -106,6 +106,14 @@ class TrainingArguments(HfTrainingArguments):
         },
     )
 
+    monitor_steps: int = field(
+        default=10,
+        metadata={
+            "help": "Log per-component grad norms and per-task losses every "
+            "this many optimizer steps."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         if self.dataloader_persistent_workers:
