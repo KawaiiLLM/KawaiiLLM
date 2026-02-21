@@ -68,14 +68,16 @@ class GradNormCallback(TrainerCallback):
                 norms[k] = sq_gpu.item() ** 0.5 if sq_gpu is not None else 0.0
                 self._gpu_sq[k] = None  # reset
 
-            total = (sum(v ** 2 for v in norms.values()) ** 0.5) or 1.0
+            # Use squared norms (energy) for percentages so they sum to 100%
+            sq = {k: v ** 2 for k, v in norms.items()}
+            total_sq = sum(sq.values()) or 1.0
             logger.info(
                 "Step %d component grad norms — "
                 "projector: %.3e (%.1f%%)  meme: %.3e (%.1f%%)  llm: %.3e (%.1f%%)",
                 state.global_step,
-                norms["projector"], 100 * norms["projector"] / total,
-                norms["meme"],      100 * norms["meme"]      / total,
-                norms["llm"],       100 * norms["llm"]       / total,
+                norms["projector"], 100 * sq["projector"] / total_sq,
+                norms["meme"],      100 * sq["meme"]      / total_sq,
+                norms["llm"],       100 * sq["llm"]       / total_sq,
             )
 
     def on_train_end(self, args, state, control, **kwargs):
