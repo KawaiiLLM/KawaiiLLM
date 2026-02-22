@@ -15,14 +15,25 @@ from .model import KawaiiLLMModel, RMSNorm
 
 logger = logging.getLogger(__name__)
 
+try:
+    from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+    _HAS_TENSORBOARD = True
+except ImportError:
+    _HAS_TENSORBOARD = False
+
 
 class GradNormCallback(TrainerCallback):
-    """Log per-component gradient norms every logging_steps optimizer steps.
+    """Log per-component gradient norms every optimizer step to TensorBoard,
+    and every monitor_steps to the console logger.
 
     Uses gradient hooks that fire during backward (before DeepSpeed's
     reduce-scatter), so norms reflect the local pre-reduction gradients.
     For relative comparison across components this is correct; absolute
     values may differ slightly from the global grad_norm logged by HF Trainer.
+
+    TensorBoard keys written every optimizer step:
+        grad_norm/{projector,meme,llm}        — L2 norm per component
+        grad_energy_pct/{projector,meme,llm}  — squared-norm fraction (%)
     """
 
     COMPONENTS = ("projector", "meme", "llm")
@@ -33,8 +44,15 @@ class GradNormCallback(TrainerCallback):
         # Synced only once per monitor interval (3 .item() calls total).
         self._gpu_sq: Dict[str, Optional[torch.Tensor]] = {k: None for k in self.COMPONENTS}
         self._hooks: list = []
+        self._writer = None  # SummaryWriter, rank-0 only
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        # Open TensorBoard writer on rank 0.
+        # Fall back to <output_dir>/tensorboard when --logging_dir is not set.
+        if state.is_world_process_zero and _HAS_TENSORBOARD:
+            log_dir = args.logging_dir or os.path.join(args.output_dir, "tensorboard")
+            self._writer = _SummaryWriter(log_dir=log_dir)
+
         # Only register hooks on rank 0: other ranks' gradients are local
         # pre-reduction values that we never read, so skip the accumulation cost.
         if not state.is_world_process_zero:
@@ -74,23 +92,40 @@ class GradNormCallback(TrainerCallback):
             norms[k] = sq_gpu.item() ** 0.5 if sq_gpu is not None else 0.0
             self._gpu_sq[k] = None  # reset for next optimizer step
 
-        if state.global_step % self._monitor_steps == 0 and state.global_step > 0:
-            # Use squared norms (energy) for percentages so they sum to 100%
+        if state.global_step > 0:
             sq = {k: v ** 2 for k, v in norms.items()}
             total_sq = sum(sq.values()) or 1.0
-            logger.info(
-                "Step %d component grad norms — "
-                "projector: %.3e (%.1f%%)  meme: %.3e (%.1f%%)  llm: %.3e (%.1f%%)",
-                state.global_step,
-                norms["projector"], 100 * sq["projector"] / total_sq,
-                norms["meme"],      100 * sq["meme"]      / total_sq,
-                norms["llm"],       100 * sq["llm"]       / total_sq,
-            )
+
+            # Write to TensorBoard every optimizer step
+            if self._writer is not None:
+                for k, v in norms.items():
+                    self._writer.add_scalar(f"grad_norm/{k}", v, state.global_step)
+                for k in norms:
+                    self._writer.add_scalar(
+                        f"grad_energy_pct/{k}",
+                        100.0 * sq[k] / total_sq,
+                        state.global_step,
+                    )
+                self._writer.flush()
+
+            # Console log every monitor_steps
+            if state.global_step % self._monitor_steps == 0:
+                logger.info(
+                    "Step %d component grad norms — "
+                    "projector: %.3e (%.1f%%)  meme: %.3e (%.1f%%)  llm: %.3e (%.1f%%)",
+                    state.global_step,
+                    norms["projector"], 100 * sq["projector"] / total_sq,
+                    norms["meme"],      100 * sq["meme"]      / total_sq,
+                    norms["llm"],       100 * sq["llm"]       / total_sq,
+                )
 
     def on_train_end(self, args, state, control, **kwargs):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
 
 
 class NaNDetectorCallback(TrainerCallback):
@@ -121,17 +156,29 @@ class NaNDetectorCallback(TrainerCallback):
 
 
 class TaskLossCallback(TrainerCallback):
-    """Log per-task mean losses from model._task_accum every logging_steps.
+    """Log per-task mean losses and gradient contribution proxies.
 
     task_accum is filled by KawaiiLLMModel._store_task_info() after every
     training forward pass (including gradient-accumulation micro-batches),
-    so each logging interval covers all micro-batches in that window.
+    so each monitor interval covers all micro-batches in that window.
+
+    TensorBoard keys written every monitor_steps:
+        task_loss/{ntp,recon,cont}            — mean loss per task
+        task_grad_contrib_pct/{ntp,recon,cont} — gradient contribution proxy (%):
+            contrib[task] = mean_loss[task] * n_samples[task], normalized to 100%.
+            Proportional to total loss energy per task, which drives gradient magnitude.
     """
 
     _TASK_NAMES = {0: "ntp", 1: "recon", 2: "cont"}
 
     def __init__(self, monitor_steps: int = 100):
         self._monitor_steps = monitor_steps
+        self._writer = None  # SummaryWriter, rank-0 only
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and _HAS_TENSORBOARD:
+            log_dir = args.logging_dir or os.path.join(args.output_dir, "tensorboard")
+            self._writer = _SummaryWriter(log_dir=log_dir)
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if not state.is_world_process_zero:
@@ -142,18 +189,105 @@ class TaskLossCallback(TrainerCallback):
         if not isinstance(m, KawaiiLLMModel) or not hasattr(m, "_task_accum"):
             return
 
+        task_stats: Dict[str, tuple] = {}  # name -> (mean_loss, n_samples)
         parts = []
         for tid, name in self._TASK_NAMES.items():
             vals = m._task_accum.get(tid, [])
             if vals:
                 avg = sum(vals) / len(vals)
+                task_stats[name] = (avg, len(vals))
                 parts.append(f"{name}: {avg:.4f} (n={len(vals)})")
             m._task_accum[tid] = []  # clear after reading
 
-        if parts:
-            logger.info(
-                "Step %d task losses — %s", state.global_step, "  ".join(parts)
+        if not parts:
+            return
+
+        logger.info("Step %d task losses — %s", state.global_step, "  ".join(parts))
+
+        if self._writer is None:
+            return
+
+        # Per-task mean loss
+        for name, (avg, _) in task_stats.items():
+            self._writer.add_scalar(f"task_loss/{name}", avg, state.global_step)
+
+        # Per-task gradient contribution proxy: mean_loss * n_samples, normalized
+        contrib = {name: avg * n for name, (avg, n) in task_stats.items()}
+        total_contrib = sum(contrib.values()) or 1.0
+        for name, val in contrib.items():
+            self._writer.add_scalar(
+                f"task_grad_contrib_pct/{name}",
+                100.0 * val / total_contrib,
+                state.global_step,
             )
+        self._writer.flush()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+
+class LRLogCallback(TrainerCallback):
+    """Log per-component learning rates to TensorBoard every optimizer step.
+
+    LR is captured in on_step_begin (after LLMFreezeCallback has applied any
+    freeze/ramp-up adjustments to param_groups) so the logged value matches
+    the LR actually used for that step's optimizer.step() call.
+
+    IMPORTANT: this callback must be registered AFTER LLMFreezeCallback in the
+    callbacks list so that on_step_begin fires after the freeze logic runs.
+
+    TensorBoard keys written every optimizer step:
+        lr/meme      — MemE encoder LR
+        lr/llm       — LLM decoder LR (0 during LLM freeze period)
+        lr/projector — Projector + mem_embeddings LR
+    """
+
+    # Param group name prefixes defined in KawaiiTrainer.create_optimizer
+    _COMPONENTS = ("meme", "llm", "projector", "mem_embeddings")
+
+    def __init__(self):
+        self._writer = None
+        self._buffered_lr: Dict[str, float] = {}  # captured in on_step_begin
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero and _HAS_TENSORBOARD:
+            log_dir = args.logging_dir or os.path.join(args.output_dir, "tensorboard")
+            self._writer = _SummaryWriter(log_dir=log_dir)
+
+    def on_step_begin(self, args, state, control, optimizer=None, **kwargs):
+        """Capture effective LR after freeze callbacks have modified param_groups."""
+        if not state.is_world_process_zero or optimizer is None:
+            return
+        comp_lr: Dict[str, float] = {}
+        for group in optimizer.param_groups:
+            name = group.get("name", "")
+            for comp in self._COMPONENTS:
+                if name.startswith(comp) and comp not in comp_lr:
+                    comp_lr[comp] = group["lr"]
+        # projector and mem_embeddings share the same target LR — merge into one
+        proj_lr = comp_lr.get("projector") or comp_lr.get("mem_embeddings")
+        if proj_lr is not None:
+            self._buffered_lr["lr/projector"] = proj_lr
+        for comp in ("meme", "llm"):
+            if comp in comp_lr:
+                self._buffered_lr[f"lr/{comp}"] = comp_lr[comp]
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero or self._writer is None:
+            return
+        if not self._buffered_lr:
+            return
+        for key, val in self._buffered_lr.items():
+            self._writer.add_scalar(key, val, state.global_step)
+        self._writer.flush()
+        self._buffered_lr.clear()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
 
 
 class LLMFreezeCallback(TrainerCallback):

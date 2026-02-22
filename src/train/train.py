@@ -22,7 +22,7 @@ from .arguments import DataArguments, ModelArguments, TrainingArguments
 from .collator import KawaiiDataCollator
 from .dataset import KawaiiDataset
 from .model import SPECIAL_TOKENS, KawaiiLLMModel
-from .trainer import CurriculumCallback, GradNormCallback, LLMFreezeCallback, NaNDetectorCallback, TaskLossCallback, KawaiiTrainer
+from .trainer import CurriculumCallback, GradNormCallback, LLMFreezeCallback, LRLogCallback, NaNDetectorCallback, TaskLossCallback, KawaiiTrainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,6 +201,9 @@ def train():
             freeze_ratio=training_args.llm_freeze_ratio,
             unfreeze_warmup_ratio=training_args.llm_unfreeze_warmup_ratio,
         ))
+    # LRLogCallback must come after LLMFreezeCallback so that on_step_begin
+    # reads the post-freeze LR (0 for LLM during freeze, normal otherwise).
+    callbacks.append(LRLogCallback())
         logger.info(
             "LLM freeze enabled: LLM LR=0 for first %.1f%%, ramp-up over next %.1f%%",
             training_args.llm_freeze_ratio * 100,
