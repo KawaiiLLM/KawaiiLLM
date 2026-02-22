@@ -106,7 +106,9 @@ class GradNormCallback(TrainerCallback):
                         100.0 * sq[k] / total_sq,
                         state.global_step,
                     )
-                self._writer.flush()
+                # Flush every monitor_steps to avoid per-step syscall overhead
+                if state.global_step % self._monitor_steps == 0:
+                    self._writer.flush()
 
             # Console log every monitor_steps
             if state.global_step % self._monitor_steps == 0:
@@ -266,8 +268,11 @@ class LRLogCallback(TrainerCallback):
             for comp in self._COMPONENTS:
                 if name.startswith(comp) and comp not in comp_lr:
                     comp_lr[comp] = group["lr"]
-        # projector and mem_embeddings share the same target LR — merge into one
-        proj_lr = comp_lr.get("projector") or comp_lr.get("mem_embeddings")
+        # projector and mem_embeddings share the same target LR — merge into one.
+        # Use explicit None check (not `or`) so lr=0.0 is reported correctly.
+        proj_lr = comp_lr.get("projector")
+        if proj_lr is None:
+            proj_lr = comp_lr.get("mem_embeddings")
         if proj_lr is not None:
             self._buffered_lr["lr/projector"] = proj_lr
         for comp in ("meme", "llm"):
@@ -281,7 +286,6 @@ class LRLogCallback(TrainerCallback):
             return
         for key, val in self._buffered_lr.items():
             self._writer.add_scalar(key, val, state.global_step)
-        self._writer.flush()
         self._buffered_lr.clear()
 
     def on_train_end(self, args, state, control, **kwargs):
