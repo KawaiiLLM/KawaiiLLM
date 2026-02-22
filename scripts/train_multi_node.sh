@@ -80,8 +80,10 @@ torchrun \
   --save_strategy steps \
   --save_steps 5000 \
   --save_total_limit 5 \
+  --per_device_eval_batch_size 2 \
   --eval_strategy steps \
   --eval_steps 500 \
+  --prediction_loss_only True \
   --logging_steps 1 \
   --monitor_steps 10 \
   --dataloader_num_workers 32 \

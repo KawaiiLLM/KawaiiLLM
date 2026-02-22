@@ -525,6 +525,13 @@ class KawaiiTrainer(Trainer):
         optimizer_kwargs.pop("lr", None)
 
         self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+
+        # HF Trainer 5.x sets callback_handler.optimizer = None at __init__ and
+        # never updates it.  Callbacks that need the optimizer (LRLogCallback,
+        # LLMFreezeCallback) silently no-op without this fix.
+        if getattr(self, "callback_handler", None) is not None:
+            self.callback_handler.optimizer = self.optimizer
+
         return self.optimizer
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
