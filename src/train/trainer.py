@@ -156,6 +156,69 @@ class TaskLossCallback(TrainerCallback):
             )
 
 
+class LLMFreezeCallback(TrainerCallback):
+    """Freeze LLM for the first R% of training by setting its optimizer LR to 0.
+
+    This keeps LLM parameters in the optimizer (DeepSpeed gradient buckets
+    unchanged) but prevents any weight updates. The scheduler still runs
+    normally; when the freeze ends, the LLM inherits whatever LR the
+    scheduler has reached at that point.
+
+    NTP samples are effectively wasted during the freeze period since they
+    only produce gradients for the LLM (MemE/projector dummy forward
+    contributes zero gradient).
+    """
+
+    _LLM_GROUP_NAMES = {"llm_decay", "llm_no_decay"}
+
+    def __init__(self, freeze_ratio: float, unfreeze_warmup_ratio: float = 0.01):
+        self._freeze_ratio = freeze_ratio
+        self._unfreeze_warmup_ratio = unfreeze_warmup_ratio
+        self._freeze_steps: int = 0          # resolved in on_train_begin
+        self._unfreeze_warmup_steps: int = 0  # resolved in on_train_begin
+        self._logged_unfreeze = False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._freeze_steps = int(state.max_steps * self._freeze_ratio)
+        self._unfreeze_warmup_steps = int(state.max_steps * self._unfreeze_warmup_ratio)
+        if state.is_world_process_zero:
+            logger.info(
+                "LLMFreezeCallback: freeze=%.1f%% (%d steps), "
+                "unfreeze_warmup=%.1f%% (%d steps), total=%d steps",
+                self._freeze_ratio * 100, self._freeze_steps,
+                self._unfreeze_warmup_ratio * 100, self._unfreeze_warmup_steps,
+                state.max_steps,
+            )
+
+    def on_step_begin(self, args, state, control, optimizer=None, **kwargs):
+        if optimizer is None:
+            return
+        step = state.global_step
+
+        if step < self._freeze_steps:
+            # Full freeze: zero out LLM LR
+            for group in optimizer.param_groups:
+                if group.get("name", "") in self._LLM_GROUP_NAMES:
+                    group["lr"] = 0.0
+
+        elif self._unfreeze_warmup_steps > 0 and step < self._freeze_steps + self._unfreeze_warmup_steps:
+            # Linear ramp-up: scale scheduler's current LR by progress ratio
+            progress = (step - self._freeze_steps) / self._unfreeze_warmup_steps
+            for group in optimizer.param_groups:
+                if group.get("name", "") in self._LLM_GROUP_NAMES:
+                    group["lr"] = group["lr"] * progress
+        # else: beyond freeze+warmup, let scheduler LR pass through unchanged
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self._logged_unfreeze and state.global_step == self._freeze_steps:
+            self._logged_unfreeze = True
+            if state.is_world_process_zero:
+                logger.info(
+                    "Step %d: LLM unfreezing — ramp-up over next %d steps",
+                    state.global_step, self._unfreeze_warmup_steps,
+                )
+
+
 class CurriculumCallback(TrainerCallback):
     """Updates current epoch on dataset for deterministic task rotation.
 

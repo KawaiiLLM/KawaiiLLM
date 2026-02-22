@@ -121,6 +121,26 @@ class TrainingArguments(HfTrainingArguments):
         },
     )
 
+    llm_freeze_ratio: float = field(
+        default=0.0,
+        metadata={
+            "help": "Freeze LLM for the first N%% of total training steps by "
+            "setting its LR to 0. Only MemE and projector are trained during "
+            "this period. Set to 0.0 to disable (default). E.g. 0.05 = first "
+            "5%% of steps. Note: NTP samples are effectively wasted during the "
+            "freeze since they only train the LLM."
+        },
+    )
+    llm_unfreeze_warmup_ratio: float = field(
+        default=0.01,
+        metadata={
+            "help": "After the LLM freeze ends, linearly ramp up LLM LR from "
+            "0 to the scheduler's current value over this fraction of total "
+            "training steps. Prevents a sudden LR jump on unfreeze. "
+            "Default: 0.01 (1%%). Set to 0.0 to disable ramp-up."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         if self.dataloader_persistent_workers:

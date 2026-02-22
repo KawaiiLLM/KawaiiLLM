@@ -22,7 +22,7 @@ from .arguments import DataArguments, ModelArguments, TrainingArguments
 from .collator import KawaiiDataCollator
 from .dataset import KawaiiDataset
 from .model import SPECIAL_TOKENS, KawaiiLLMModel
-from .trainer import CurriculumCallback, GradNormCallback, NaNDetectorCallback, TaskLossCallback, KawaiiTrainer
+from .trainer import CurriculumCallback, GradNormCallback, LLMFreezeCallback, NaNDetectorCallback, TaskLossCallback, KawaiiTrainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -187,10 +187,22 @@ def train():
     collator = KawaiiDataCollator(tokenizer=tokenizer)
 
     # Build callbacks
-    curriculum_cb = CurriculumCallback(dataset=dataset)
-    nan_detector_cb = NaNDetectorCallback()
-    grad_norm_cb = GradNormCallback(monitor_steps=training_args.monitor_steps)
-    task_loss_cb = TaskLossCallback(monitor_steps=training_args.monitor_steps)
+    callbacks = [
+        CurriculumCallback(dataset=dataset),
+        NaNDetectorCallback(),
+        GradNormCallback(monitor_steps=training_args.monitor_steps),
+        TaskLossCallback(monitor_steps=training_args.monitor_steps),
+    ]
+    if training_args.llm_freeze_ratio > 0.0:
+        callbacks.append(LLMFreezeCallback(
+            freeze_ratio=training_args.llm_freeze_ratio,
+            unfreeze_warmup_ratio=training_args.llm_unfreeze_warmup_ratio,
+        ))
+        logger.info(
+            "LLM freeze enabled: LLM LR=0 for first %.1f%%, ramp-up over next %.1f%%",
+            training_args.llm_freeze_ratio * 100,
+            training_args.llm_unfreeze_warmup_ratio * 100,
+        )
 
     # Build trainer
     trainer = KawaiiTrainer(
@@ -200,7 +212,7 @@ def train():
         eval_dataset=val_dataset,
         data_collator=collator,
         tokenizer=tokenizer,
-        callbacks=[curriculum_cb, nan_detector_cb, grad_norm_cb, task_loss_cb],
+        callbacks=callbacks,
         meme_lr=model_args.meme_lr,
         llm_lr=model_args.llm_lr,
         projector_lr=model_args.projector_lr,

@@ -64,24 +64,26 @@ torchrun \
   --num_mem_tokens 128 \
   --attn_implementation flash_attention_2 \
   --freeze_meme False \
-  --projector_lr 5e-5 \
-  --meme_lr 5e-5 \
-  --llm_lr 1e-5 \
+  --projector_lr 2e-5 \
+  --meme_lr 2e-5 \
+  --llm_lr 2e-5 \
+  --llm_freeze_ratio 0.03 \
+  --llm_unfreeze_warmup_ratio 0.01 \
   --bf16 True \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 8 \
   --num_train_epochs 2 \
-  --learning_rate 1e-5 \
+  --learning_rate 2e-5 \
   --warmup_ratio 0.03 \
   --lr_scheduler_type cosine \
   --weight_decay 0.01 \
   --tf32 True \
   --gradient_checkpointing True \
   --save_strategy steps \
-  --save_steps 5000 \
+  --save_steps 2000 \
   --save_total_limit 5 \
   --eval_strategy steps \
-  --eval_steps 500 \
+  --eval_steps 100 \
   --logging_steps 1 \
   --monitor_steps 10 \
   --dataloader_num_workers 32 \
