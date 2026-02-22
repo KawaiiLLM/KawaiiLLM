@@ -11,7 +11,7 @@ Architecture dimensions (dynamically read from model configs):
     - mem_embeddings: nn.Embedding(num_mem_tokens, meme_hidden)
 
 Special tokens:
-    - <mem> / </mem>: memory boundary markers (both MemE and LLM side)
+    - <mem> / </mem>: memory boundary markers (LLM side only)
     - <mempad>: placeholder (unused at runtime, reserved for tokenizer)
     - <AE>: auto-encoding mode signal (LLM side, reconstruction task only)
 """
@@ -274,9 +274,15 @@ class KawaiiLLMModel(nn.Module):
         context_attention_mask: torch.LongTensor,
         n_mem: int,
     ) -> torch.Tensor:
-        """Encode context through MemE with <mem> Q_1..Q_n </mem> boundary tokens.
+        """Encode context through MemE with MEM tokens appended at the end.
 
-        Input layout: [text_tokens (left-padded)] [<mem>] [Q_1, ..., Q_n] [</mem>]
+        Input layout: [text_tokens (left-padded)] [Q_1, ..., Q_n]
+
+        No <mem>/</mem> boundary tokens on the MemE side. Qwen3-Embedding-4B
+        uses causal attention + last-token pooling: the last position naturally
+        aggregates the full sequence. Placing MEM tokens directly at the end
+        lets Q_n occupy this privileged last position. Inserting </mem> after
+        Q_n would waste that position (its hidden state is discarded).
 
         When called with per-sample n_mem, forward() passes max(n_mem) here.
         All Q tokens interact through MemE self-attention; forward() then
@@ -292,11 +298,6 @@ class KawaiiLLMModel(nn.Module):
         Returns:
             mem_hidden: [B, n_mem, meme_hidden] — compressed memory vectors.
         """
-        if self._mem_token_id is None:
-            raise RuntimeError(
-                "Special token IDs not set. Call set_special_token_ids() first."
-            )
-
         B = context_ids.shape[0]
         device = context_ids.device
         meme_embed = self.meme.get_input_embeddings()
@@ -304,32 +305,25 @@ class KawaiiLLMModel(nn.Module):
         # Get text embeddings from MemE's embedding layer
         text_embeds = meme_embed(context_ids)  # [B, L, meme_hidden]
 
-        # Get <mem> and </mem> boundary token embeddings (using cached buffers)
-        mem_start_emb = meme_embed(self._mem_id_buf)      # [1, meme_hidden]
-        mem_end_emb = meme_embed(self._mem_end_id_buf)    # [1, meme_hidden]
-        # Expand to batch: [B, 1, meme_hidden]
-        mem_start_emb = mem_start_emb.unsqueeze(0).expand(B, -1, -1)
-        mem_end_emb = mem_end_emb.unsqueeze(0).expand(B, -1, -1)
-
         # Get MEM token (Query) embeddings
         mem_embeds = self.mem_embeddings.weight[:n_mem]  # [n_mem, meme_hidden]
         mem_embeds = mem_embeds.unsqueeze(0).expand(B, -1, -1)  # [B, n_mem, meme_hidden]
 
-        # Concatenate: [text, <mem>, Q_1..Q_n, </mem>]
+        # Concatenate: [text, Q_1..Q_n]
+        # Q_n occupies the last position — equivalent to Qwen3-Embedding's last_token_pool.
         combined = torch.cat(
-            [text_embeds, mem_start_emb, mem_embeds, mem_end_emb], dim=1
-        )  # [B, L+1+n_mem+1, meme_hidden]
+            [text_embeds, mem_embeds], dim=1
+        )  # [B, L+n_mem, meme_hidden]
 
-        # Extend attention mask: boundary + MEM tokens always attend
-        extra_len = 1 + n_mem + 1  # <mem> + Q tokens + </mem>
+        # Extend attention mask: MEM tokens always attend
         extra_mask = torch.ones(
-            B, extra_len,
+            B, n_mem,
             dtype=context_attention_mask.dtype,
             device=device,
         )
         extended_mask = torch.cat(
             [context_attention_mask, extra_mask], dim=1
-        )  # [B, L+1+n_mem+1]
+        )  # [B, L+n_mem]
 
         # Prevent NaN from all-masked causal attention at left-padded positions.
         # Position 0 with mask=0 has NO valid attention targets under causal
@@ -361,10 +355,10 @@ class KawaiiLLMModel(nn.Module):
                 position_ids=position_ids,
             )
 
-        # Extract MEM token hidden states: skip </mem> at -1, take n_mem before it
-        # Layout: [..., <mem>, Q_1, ..., Q_n, </mem>]
-        # Indices: ..., -(n_mem+2), -(n_mem+1), ..., -2, -1
-        mem_hidden = outputs.last_hidden_state[:, -(n_mem + 1):-1, :]  # [B, n_mem, meme_hidden]
+        # Extract the last n_mem positions — the MEM token hidden states.
+        # Q_n (last position) has seen all context + all preceding Q tokens,
+        # giving it the richest global aggregation (equivalent to last_token_pool).
+        mem_hidden = outputs.last_hidden_state[:, -n_mem:, :]  # [B, n_mem, meme_hidden]
 
         if self._freeze_meme:
             # Detach to cut gradient flow, but re-enable grad for projector
@@ -441,7 +435,7 @@ class KawaiiLLMModel(nn.Module):
                 # naturally flows LLM → prefix → projector → MemE —
                 # matching the non-NTP path order exactly.
                 # Explicit single-token dummy: guarantees MemE processes exactly
-                # 4 tokens (pad + <mem> + Q + </mem>) regardless of batch content.
+                # 2 tokens (pad + Q) regardless of batch content.
                 dummy_ctx = self._pad_id_buf.view(1, 1)
                 dummy_mask = torch.ones(
                     1, 1, device=device, dtype=context_attention_mask.dtype,

@@ -184,7 +184,10 @@ def train():
             )
 
     # Build collator
-    collator = KawaiiDataCollator(tokenizer=tokenizer)
+    collator = KawaiiDataCollator(
+        tokenizer=tokenizer,
+        num_mem_tokens=model_args.num_mem_tokens,
+    )
 
     # Build callbacks
     callbacks = [

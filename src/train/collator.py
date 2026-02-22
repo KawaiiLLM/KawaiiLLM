@@ -5,13 +5,18 @@ Handles two different padding strategies:
       so MEM tokens are always at the rightmost positions.
     - input_ids / labels: RIGHT-padded (standard causal LM convention).
 
-n_mem is per-sample (sampled by dataset based on task type) and collected
-into a [B] tensor for the model to handle variable-length prefix.
+n_mem is determined per-batch: all non-NTP samples in a batch share the
+same n_mem value (uniform [1, num_mem_tokens]).  This ensures:
+    1. Zero MemE compute waste (all MEM hidden states are used).
+    2. Every non-NTP sample's last MEM token occupies the true last
+       position in the MemE sequence, inheriting last-token-pool
+       aggregation semantics from Qwen3-Embedding's causal attention.
 
 Task type (reconstruction vs continuation) is handled per-sample in the
 dataset via <AE> token in input_ids — no per-batch task_type needed.
 """
 
+import random
 from typing import Dict, List
 
 import torch
@@ -24,9 +29,10 @@ IGNORE_INDEX = -100
 class KawaiiDataCollator:
     """Collates samples with left-padded context and right-padded target."""
 
-    def __init__(self, tokenizer: PreTrainedTokenizer):
+    def __init__(self, tokenizer: PreTrainedTokenizer, num_mem_tokens: int = 128):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
+        self.num_mem_tokens = num_mem_tokens
 
     def __call__(self, instances: List[Dict]) -> Dict[str, torch.Tensor]:
         context_ids_list = [inst["context_ids"] for inst in instances]
@@ -34,7 +40,15 @@ class KawaiiDataCollator:
         labels_list = [inst["labels"] for inst in instances]
         n_mem_list = [inst["n_mem"] for inst in instances]
 
-        # --- Collect per-sample n_mem into a tensor ---
+        # --- Batch-level n_mem: all non-NTP samples share one value ---
+        # Non-NTP samples (n_mem > 0) get a single randomly sampled n_mem.
+        # This ensures all MEM tokens in encode_context are used (zero waste)
+        # and every sample's last Q token occupies the true last position.
+        has_non_ntp = any(nm > 0 for nm in n_mem_list)
+        if has_non_ntp:
+            batch_n_mem = random.randint(1, self.num_mem_tokens)
+            n_mem_list = [batch_n_mem if nm > 0 else 0 for nm in n_mem_list]
+
         n_mem = torch.tensor(n_mem_list, dtype=torch.long)  # [B]
 
         # --- Left-pad context_ids (for MemE, padding_side='left') ---
