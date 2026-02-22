@@ -72,7 +72,14 @@ class DataArguments:
     )
     index_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to pre-built index JSON file."},
+        metadata={"help": "Path to pre-built train index JSON file."},
+    )
+    val_index_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to pre-built val index JSON file. "
+            "If set and file exists, enables eval during training."
+        },
     )
     context_max_length: int = field(
         default=4096,

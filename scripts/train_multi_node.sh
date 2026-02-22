@@ -59,6 +59,7 @@ torchrun \
     data/math/formatted \
     data/code/formatted \
   --index_path data/train_index.json \
+  --val_index_path data/train_index_val.json \
   --output_dir /mnt/volumes/ss-sai-bd-ga/zhaoqixuan/output/kawaii_4b_8b \
   --num_mem_tokens 128 \
   --attn_implementation flash_attention_2 \
@@ -67,8 +68,8 @@ torchrun \
   --meme_lr 1e-5 \
   --llm_lr 1e-5 \
   --bf16 True \
-  --per_device_train_batch_size 2 \
-  --gradient_accumulation_steps 8 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
   --num_train_epochs 2 \
   --learning_rate 1e-5 \
   --warmup_ratio 0.03 \
@@ -79,6 +80,8 @@ torchrun \
   --save_strategy steps \
   --save_steps 5000 \
   --save_total_limit 5 \
+  --eval_strategy steps \
+  --eval_steps 500 \
   --logging_steps 1 \
   --monitor_steps 10 \
   --dataloader_num_workers 32 \

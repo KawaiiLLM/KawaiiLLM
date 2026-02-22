@@ -90,7 +90,7 @@ python src/train/build_index.py \
   --data_dirs data/novels/formatted data/bilibili/formatted ... \
   --output_path data/train_index.json \
   --upsample moegirl:3 \
-  --merge_max_tokens 3500 --merge_short_threshold 2048
+  --merge_max_tokens 4000 --merge_short_threshold 2048
 ```
 
 ---
@@ -408,6 +408,82 @@ deepspeed --num_gpus 8 --module src.train.train \
 ```
 
 > **Phase 1 = 全参数训练**: `--freeze_meme False`，MemE backbone 参与训练但使用较低学习率 (`1e-5`)。Flash Attention 2 同时对 MemE 和 LLM 生效。
+
+---
+
+## Step 10: Multi-node Launch Script (`scripts/train_multi_node.sh`)
+
+Uses `torchrun` + DeepSpeed (as library) for multi-node distributed training. Environment variables are injected by the cluster scheduler.
+
+```bash
+#!/bin/bash
+# KawaiiLLM multi-node training launch script
+#
+# Uses torchrun + DeepSpeed (as library) for multi-node distributed training.
+# Environment variables are injected by the cluster scheduler:
+#   MASTER_ADDR  — master node IP
+#   MASTER_PORT  — communication port
+#   NODE_NUM     — total number of nodes
+#   GPU_NUM      — GPUs per node
+#   RANK         — current node rank (0-based)
+
+set -euo pipefail
+
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+NODE_NUM="${NODE_NUM:-1}"
+GPU_NUM="${GPU_NUM:-8}"
+RANK="${RANK:-0}"
+
+torchrun \
+  --master-addr="${MASTER_ADDR}" \
+  --master-port="${MASTER_PORT}" \
+  --nnodes="${NODE_NUM}" \
+  --nproc-per-node="${GPU_NUM}" \
+  --node_rank="${RANK}" \
+  -m src.train.train \
+  --deepspeed configs/ds_zero2.json \
+  --meme_model_name_or_path /lpai/inputs/models/Qwen__Qwen3-Embedding-4B-main/ \
+  --llm_model_name_or_path /lpai/inputs/models/qwen__qwen3-8b-base-25-04-28-1833/ \
+  --data_dirs \
+    data/novels/formatted \
+    data/bilibili/formatted \
+    data/moegirl/formatted \
+    data/games/formatted \
+    data/general/formatted \
+    data/math/formatted \
+    data/code/formatted \
+  --index_path data/train_index.json \
+  --val_index_path data/train_index_val.json \
+  --output_dir /mnt/volumes/ss-sai-bd-ga/zhaoqixuan/output/kawaii_4b_8b \
+  --num_mem_tokens 128 \
+  --attn_implementation flash_attention_2 \
+  --freeze_meme False \
+  --projector_lr 1e-5 \
+  --meme_lr 1e-5 \
+  --llm_lr 1e-5 \
+  --bf16 True \
+  --per_device_train_batch_size 2 \
+  --gradient_accumulation_steps 8 \
+  --num_train_epochs 2 \
+  --learning_rate 1e-5 \
+  --warmup_ratio 0.03 \
+  --lr_scheduler_type cosine \
+  --weight_decay 0.01 \
+  --tf32 True \
+  --gradient_checkpointing True \
+  --save_strategy steps \
+  --save_steps 5000 \
+  --save_total_limit 5 \
+  --eval_strategy steps \
+  --eval_steps 500 \
+  --logging_steps 1 \
+  --monitor_steps 10 \
+  --dataloader_num_workers 32 \
+  --logging_dir /lpai/output/tensorboard \
+  --report_to tensorboard \
+  --run_name kawaii_4b_8b
+```
 
 ---
 

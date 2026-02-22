@@ -201,22 +201,37 @@ class KawaiiTrainer(Trainer):
         self._projector_lr = projector_lr
         super().__init__(**kwargs)
 
-    def get_train_dataloader(self) -> DataLoader:
-        """Override to inject worker_init_fn for file handle safety.
+    def _inject_worker_init_fn(self, dataloader: DataLoader) -> DataLoader:
+        """Inject KawaiiDataset.worker_init_fn into a dataloader.
 
         Composes with HF Trainer's seed_worker to preserve torch/numpy
         seed initialization while also resetting file handles and RNG.
+        Each forked worker must open its own file handles (byte-offset seeks
+        on shared handles cause corrupted reads).
         """
+        original_init = dataloader.worker_init_fn
+
+        def combined_init(worker_id):
+            if original_init is not None:
+                original_init(worker_id)
+            KawaiiDataset.worker_init_fn(worker_id)
+
+        dataloader.worker_init_fn = combined_init
+        return dataloader
+
+    def get_train_dataloader(self) -> DataLoader:
+        """Override to inject worker_init_fn for file handle safety."""
         dataloader = super().get_train_dataloader()
         if isinstance(self.train_dataset, KawaiiDataset):
-            original_init = dataloader.worker_init_fn
+            self._inject_worker_init_fn(dataloader)
+        return dataloader
 
-            def combined_init(worker_id):
-                if original_init is not None:
-                    original_init(worker_id)
-                KawaiiDataset.worker_init_fn(worker_id)
-
-            dataloader.worker_init_fn = combined_init
+    def get_eval_dataloader(self, eval_dataset=None) -> DataLoader:
+        """Override to inject worker_init_fn for file handle safety."""
+        dataloader = super().get_eval_dataloader(eval_dataset)
+        ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if isinstance(ds, KawaiiDataset):
+            self._inject_worker_init_fn(dataloader)
         return dataloader
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):

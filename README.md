@@ -643,6 +643,31 @@ llm             -= lr_low  * ∂loss/∂llm
 |差异化学习率|为 MEM embeddings / Projector / MemE backbone / LLM 设置独立学习率|
 |分模型保存|参考 C3 的 `C3Trainer`，MemE 和 LLM 独立保存 checkpoint|
 
+##### 运行训练
+
+**Step 1: 构建索引** (数据格式化后运行一次):
+```bash
+python src/train/build_index.py \
+  --data_dirs data/novels/formatted data/bilibili/formatted \
+    data/moegirl/formatted data/games/formatted \
+    data/general/formatted data/math/formatted data/code/formatted \
+  --output_path data/train_index.json \
+  --upsample moegirl:3 \
+  --merge_max_tokens 4000 --merge_short_threshold 2048
+```
+
+**Step 2: 启动训练** (单机 8x A800):
+```bash
+bash configs/train_8xa800.sh
+```
+运行前请编辑 `train_8xa800.sh` 中的模型路径 (`meme_model_name_or_path`, `llm_model_name_or_path`)。
+
+**多机训练** (使用 torchrun + DeepSpeed):
+```bash
+bash scripts/train_multi_node.sh
+```
+环境变量 `MASTER_ADDR`, `MASTER_PORT`, `NODE_NUM`, `GPU_NUM`, `RANK` 由集群调度器注入 (或默认为单机配置)。
+
 # 参考资料
 
 - [C3-Context-Cascade-Compression](https://github.com/liufanfanlff/C3-Context-Cascade-Compression)（代码基础）

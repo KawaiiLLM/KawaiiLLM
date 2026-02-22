@@ -71,6 +71,9 @@ src/train/
 configs/
 ├── ds_zero2.json      # DeepSpeed ZeRO-2 config for 8x A800
 └── train_8xa800.sh    # Launch script
+scripts/
+├── build_index.sh      # Script to build training index
+└── train_multi_node.sh # Multi-node training launch script (torchrun + DeepSpeed)
 ```
 
 ### Training Pipeline
@@ -83,7 +86,7 @@ python src/train/build_index.py \
     data/general/formatted data/math/formatted data/code/formatted \
   --output_path data/train_index.json \
   --upsample moegirl:3 \
-  --merge_max_tokens 3500 --merge_short_threshold 2048
+  --merge_max_tokens 4000 --merge_short_threshold 2048
 ```
 
 **Step 2: Launch training** (8x A800 80GB):
@@ -91,6 +94,12 @@ python src/train/build_index.py \
 bash configs/train_8xa800.sh
 ```
 Edit paths in `train_8xa800.sh` before running (`meme_model_name_or_path`, `llm_model_name_or_path`).
+
+**Alternative: Multi-node Training** (using torchrun + DeepSpeed):
+```bash
+bash scripts/train_multi_node.sh
+```
+Environment variables `MASTER_ADDR`, `MASTER_PORT`, `NODE_NUM`, `GPU_NUM`, `RANK` are expected (or default to single-node).
 
 ### Key Design Decisions
 - **Predecessor-based 2-task rotation**: Entries with a predecessor chunk: 2-task (reconstruction, continuation) via `(idx + epoch) % 2`. Entries without a predecessor: 2-task (NTP, reconstruction) via `(idx + epoch) % 2`. Continuation direction: prev_chunk → MemE context, current_chunk → LLM target.

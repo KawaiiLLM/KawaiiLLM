@@ -163,6 +163,26 @@ def train():
         num_mem_tokens=model_args.num_mem_tokens,
     )
 
+    # Build val dataset (if val_index_path is provided and exists)
+    # Val dataset uses fixed epoch=0 task rotation for stable eval metrics.
+    val_dataset = None
+    if data_args.val_index_path:
+        if os.path.exists(data_args.val_index_path):
+            val_dataset = KawaiiDataset(
+                index_path=data_args.val_index_path,
+                tokenizer=tokenizer,
+                context_max_length=data_args.context_max_length,
+                target_max_length=data_args.target_max_length,
+                num_mem_tokens=model_args.num_mem_tokens,
+            )
+            logger.info("Loaded val dataset: %d entries", len(val_dataset))
+        else:
+            logger.warning(
+                "val_index_path=%s not found. Evaluation disabled. "
+                "Run build_index.py with --val_ratio first.",
+                data_args.val_index_path,
+            )
+
     # Build collator
     collator = KawaiiDataCollator(tokenizer=tokenizer)
 
@@ -177,6 +197,7 @@ def train():
         model=model,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=val_dataset,
         data_collator=collator,
         tokenizer=tokenizer,
         callbacks=[curriculum_cb, nan_detector_cb, grad_norm_cb, task_loss_cb],

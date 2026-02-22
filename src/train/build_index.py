@@ -4,10 +4,15 @@ Scans all JSONL files in the given directories, records byte offset per line,
 identifies continuation pairs, optionally upsamples small sources, and merges
 short orphan chunks.
 
+Supports train/val split via --val_ratio (default 2%). The split is done at
+the document level (by source+id) so all chunks of the same document stay in
+the same split. Val set skips upsample and merge to preserve raw distribution.
+
 Usage:
     python src/train/build_index.py \
         --data_dirs data/novels/formatted data/bilibili/formatted ... \
         --output_path data/train_index.json \
+        --val_ratio 0.02 --val_output_path data/val_index.json \
         --upsample moegirl:3 \
         --merge_max_tokens 3500 --merge_short_threshold 2048
 """
@@ -16,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import random
 from collections import defaultdict
 
 logging.basicConfig(
@@ -255,6 +261,103 @@ def _make_merged_entry(entries: list, indices: list, source: str) -> dict:
     }
 
 
+def split_by_document(entries: list, val_ratio: float, seed: int = 42):
+    """Split entries into train/val at the document level (stratified by source).
+
+    Groups entries by (source, id). For each source, randomly holds out
+    val_ratio fraction of documents for validation. All chunks of the same
+    document go to the same split, preserving continuation pairs.
+
+    Args:
+        entries: list of index entries.
+        val_ratio: fraction of documents per source to hold out (0.0 to 1.0).
+        seed: random seed for reproducible splits.
+
+    Returns:
+        (train_entries, val_entries) tuple.
+    """
+    # Group entry indices by (source, id)
+    doc_entries = defaultdict(list)
+    for idx, entry in enumerate(entries):
+        key = (entry["source"], entry["id"])
+        doc_entries[key].append(idx)
+
+    # Group document keys by source for stratified splitting
+    source_docs = defaultdict(list)
+    for key in doc_entries:
+        source_docs[key[0]].append(key)
+
+    rng = random.Random(seed)
+    val_doc_keys = set()
+
+    for source, doc_keys in sorted(source_docs.items()):
+        rng.shuffle(doc_keys)
+        n_val = max(1, int(len(doc_keys) * val_ratio))
+        val_keys = doc_keys[:n_val]
+        val_doc_keys.update(val_keys)
+        logger.info(
+            "  %-15s  %5d docs total, %4d val (%.1f%%)",
+            source, len(doc_keys), len(val_keys),
+            100.0 * len(val_keys) / len(doc_keys),
+        )
+
+    # Partition entries
+    train_entries = []
+    val_entries = []
+    for idx, entry in enumerate(entries):
+        key = (entry["source"], entry["id"])
+        if key in val_doc_keys:
+            val_entries.append(entry)
+        else:
+            train_entries.append(entry)
+
+    return train_entries, val_entries
+
+
+def _log_split_stats(entries: list, continuation_pairs: list, label: str):
+    """Log per-source stats for a split."""
+    source_counts = defaultdict(int)
+    source_tokens = defaultdict(int)
+    n_merged = 0
+    for entry in entries:
+        source_counts[entry["source"]] += 1
+        source_tokens[entry["source"]] += entry["tokens"]
+        if "parts" in entry:
+            n_merged += 1
+    for source in sorted(source_counts):
+        logger.info(
+            "  [%s] %-15s  %7d entries  %10d tokens",
+            label, source, source_counts[source], source_tokens[source],
+        )
+    if n_merged:
+        logger.info("  [%s] Merged entries: %d", label, n_merged)
+
+    has_prev = set(p[1] for p in continuation_pairs)
+    n_has_prev = len(has_prev)
+    n_total = len(entries)
+    logger.info(
+        "  [%s] %d entries (%d has-prev recon/cont, %d no-prev NTP/recon), "
+        "%d continuation pairs",
+        label, n_total, n_has_prev, n_total - n_has_prev,
+        len(continuation_pairs),
+    )
+
+
+def _write_index(entries: list, continuation_pairs: list, output_path: str, label: str):
+    """Write an index file."""
+    index = {
+        "entries": entries,
+        "continuation_pairs": continuation_pairs,
+        "total_entries": len(entries),
+        "total_continuation_pairs": len(continuation_pairs),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(index, f)
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    logger.info("[%s] Index written to %s (%.1f MB)", label, output_path, file_size_mb)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build byte-offset index for formatted JSONL files."
@@ -269,7 +372,7 @@ def main():
         "--output_path",
         type=str,
         default="data/train_index.json",
-        help="Output path for the index JSON file.",
+        help="Output path for the train index JSON file.",
     )
     parser.add_argument(
         "--upsample",
@@ -289,7 +392,30 @@ def main():
         default=2048,
         help="Only merge orphan chunks below this token count.",
     )
+    parser.add_argument(
+        "--val_ratio",
+        type=float,
+        default=0.02,
+        help="Fraction of documents per source to hold out for validation. "
+        "Set to 0.0 to disable val split. Default: 0.02 (2%%).",
+    )
+    parser.add_argument(
+        "--val_output_path",
+        type=str,
+        default=None,
+        help="Output path for the val index JSON file. "
+        "Default: {output_path stem}_val.json.",
+    )
+    parser.add_argument(
+        "--split_seed",
+        type=int,
+        default=42,
+        help="Random seed for train/val document split. Default: 42.",
+    )
     args = parser.parse_args()
+
+    if args.val_ratio < 0 or args.val_ratio >= 1.0:
+        parser.error("--val_ratio must be in [0.0, 1.0)")
 
     if args.merge_max_tokens < args.merge_short_threshold:
         logger.warning(
@@ -297,6 +423,11 @@ def main():
             "orphans between these values will never merge.",
             args.merge_max_tokens, args.merge_short_threshold,
         )
+
+    # Default val output path
+    if args.val_output_path is None and args.val_ratio > 0:
+        stem, ext = os.path.splitext(args.output_path)
+        args.val_output_path = f"{stem}_val{ext}"
 
     # --- Step 1: Scan all JSONL files ---
     all_entries = []
@@ -321,70 +452,60 @@ def main():
 
     logger.info("Total entries after scan: %d", len(all_entries))
 
-    # --- Step 2: Upsample specified sources ---
-    all_entries = upsample_entries(all_entries, args.upsample)
+    # --- Step 2: Train/val split (before upsample/merge) ---
+    if args.val_ratio > 0:
+        logger.info(
+            "Splitting by document: val_ratio=%.2f, seed=%d",
+            args.val_ratio, args.split_seed,
+        )
+        train_entries, val_entries = split_by_document(
+            all_entries, args.val_ratio, args.split_seed,
+        )
+        logger.info(
+            "Split result: %d train entries, %d val entries",
+            len(train_entries), len(val_entries),
+        )
+    else:
+        train_entries = all_entries
+        val_entries = None
+
+    # --- Step 3: Process train split ---
+    logger.info("=== Processing train split ===")
+
+    # Upsample (train only)
+    train_entries = upsample_entries(train_entries, args.upsample)
     if args.upsample:
-        logger.info("Total entries after upsample: %d", len(all_entries))
+        logger.info("[train] Total entries after upsample: %d", len(train_entries))
 
-    # --- Step 3: Build continuation pairs ---
-    continuation_pairs = build_continuation_pairs(all_entries)
-    logger.info("Total continuation pairs: %d", len(continuation_pairs))
+    # Build continuation pairs
+    train_pairs = build_continuation_pairs(train_entries)
+    logger.info("[train] Continuation pairs: %d", len(train_pairs))
 
-    # --- Step 4: Merge short orphan chunks ---
-    all_entries = merge_short_orphans(
-        all_entries,
-        continuation_pairs,
+    # Merge short orphans
+    train_entries = merge_short_orphans(
+        train_entries,
+        train_pairs,
         merge_max_tokens=args.merge_max_tokens,
         merge_short_threshold=args.merge_short_threshold,
     )
-    logger.info("Total entries after merge: %d", len(all_entries))
+    logger.info("[train] Total entries after merge: %d", len(train_entries))
 
-    # Rebuild continuation pairs on final entries (indices may have shifted)
-    continuation_pairs = build_continuation_pairs(all_entries)
-    logger.info("Final continuation pairs: %d", len(continuation_pairs))
+    # Rebuild continuation pairs (indices shifted after merge)
+    train_pairs = build_continuation_pairs(train_entries)
+    logger.info("[train] Final continuation pairs: %d", len(train_pairs))
 
-    # --- Step 5: Log per-source stats ---
-    source_counts = defaultdict(int)
-    source_tokens = defaultdict(int)
-    n_merged = 0
-    for entry in all_entries:
-        source_counts[entry["source"]] += 1
-        source_tokens[entry["source"]] += entry["tokens"]
-        if "parts" in entry:
-            n_merged += 1
-    for source in sorted(source_counts):
-        logger.info(
-            "  %-15s  %7d entries  %10d tokens",
-            source, source_counts[source], source_tokens[source],
-        )
-    logger.info("  Merged entries: %d", n_merged)
+    _log_split_stats(train_entries, train_pairs, "train")
+    _write_index(train_entries, train_pairs, args.output_path, "train")
 
-    # Has-next stats (for 2-task vs 3-task rotation)
-    has_next = set(p[0] for p in continuation_pairs)
-    n_has_next = len(has_next)
-    n_total = len(all_entries)
-    logger.info(
-        "Task rotation: %d/%d (%.1f%%) entries have next chunk (3-task), "
-        "%d (%.1f%%) entries without (2-task)",
-        n_has_next, n_total, 100.0 * n_has_next / n_total if n_total else 0,
-        n_total - n_has_next,
-        100.0 * (n_total - n_has_next) / n_total if n_total else 0,
-    )
+    # --- Step 4: Process val split (no upsample, no merge) ---
+    if val_entries is not None:
+        logger.info("=== Processing val split ===")
 
-    # --- Step 6: Write index ---
-    index = {
-        "entries": all_entries,
-        "continuation_pairs": continuation_pairs,
-        "total_entries": len(all_entries),
-        "total_continuation_pairs": len(continuation_pairs),
-    }
+        val_pairs = build_continuation_pairs(val_entries)
+        logger.info("[val] Continuation pairs: %d", len(val_pairs))
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-    with open(args.output_path, "w") as f:
-        json.dump(index, f)
-
-    file_size_mb = os.path.getsize(args.output_path) / (1024 * 1024)
-    logger.info("Index written to %s (%.1f MB)", args.output_path, file_size_mb)
+        _log_split_stats(val_entries, val_pairs, "val")
+        _write_index(val_entries, val_pairs, args.val_output_path, "val")
 
 
 if __name__ == "__main__":
