@@ -1,6 +1,7 @@
 """KawaiiTrainer: custom Trainer with per-component LR, save/load, curriculum."""
 
 import logging
+import math
 import os
 from typing import Dict, List, Optional, Union
 
@@ -533,6 +534,29 @@ class KawaiiTrainer(Trainer):
             self.callback_handler.optimizer = self.optimizer
 
         return self.optimizer
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """Run evaluation and add perplexity (exp(loss)) to the reported metrics."""
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        loss_key = f"{metric_key_prefix}_loss"
+        if loss_key in metrics:
+            try:
+                ppl = math.exp(min(metrics[loss_key], 100))
+            except OverflowError:
+                ppl = float("inf")
+            ppl_key = f"{metric_key_prefix}_perplexity"
+            metrics[ppl_key] = ppl
+            self.log({ppl_key: ppl})
+            if self.is_world_process_zero():
+                logger.info(
+                    "%s perplexity: %.4f  (loss=%.4f)",
+                    metric_key_prefix, ppl, metrics[loss_key],
+                )
+        return metrics
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         """Save model components to separate subdirectories."""

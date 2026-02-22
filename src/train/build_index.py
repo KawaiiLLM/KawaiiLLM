@@ -261,20 +261,28 @@ def _make_merged_entry(entries: list, indices: list, source: str) -> dict:
     }
 
 
-def split_by_document(entries: list, val_ratio: float, seed: int = 42):
-    """Split entries into train/val at the document level (stratified by source).
+def split_by_document(
+    entries: list,
+    val_ratio: float,
+    test_ratio: float = 0.0,
+    seed: int = 42,
+):
+    """Split entries into train/val/test at the document level (stratified by source).
 
     Groups entries by (source, id). For each source, randomly holds out
-    val_ratio fraction of documents for validation. All chunks of the same
-    document go to the same split, preserving continuation pairs.
+    val_ratio fraction of documents for validation and test_ratio fraction
+    for testing. All chunks of the same document go to the same split,
+    preserving continuation pairs.
 
     Args:
         entries: list of index entries.
-        val_ratio: fraction of documents per source to hold out (0.0 to 1.0).
+        val_ratio: fraction of documents per source to hold out for val.
+        test_ratio: fraction of documents per source to hold out for test.
         seed: random seed for reproducible splits.
 
     Returns:
-        (train_entries, val_entries) tuple.
+        (train_entries, val_entries, test_entries) tuple.
+        test_entries is always a list (empty when test_ratio == 0).
     """
     # Group entry indices by (source, id)
     doc_entries = defaultdict(list)
@@ -289,29 +297,44 @@ def split_by_document(entries: list, val_ratio: float, seed: int = 42):
 
     rng = random.Random(seed)
     val_doc_keys = set()
+    test_doc_keys = set()
 
     for source, doc_keys in sorted(source_docs.items()):
         rng.shuffle(doc_keys)
-        n_val = max(1, int(len(doc_keys) * val_ratio))
+        n_docs = len(doc_keys)
+        n_val = max(1, int(n_docs * val_ratio)) if val_ratio > 0 else 0
+        n_test = max(1, int(n_docs * test_ratio)) if test_ratio > 0 else 0
+        # Clamp so val + test never exceeds total docs
+        n_val = min(n_val, n_docs)
+        n_test = min(n_test, max(0, n_docs - n_val))
+
         val_keys = doc_keys[:n_val]
+        test_keys = doc_keys[n_val:n_val + n_test]
         val_doc_keys.update(val_keys)
+        test_doc_keys.update(test_keys)
+
+        log_parts = [f"{n_val} val ({100.0*n_val/n_docs:.2f}%)"]
+        if test_ratio > 0:
+            log_parts.append(f"{n_test} test ({100.0*n_test/n_docs:.2f}%)")
         logger.info(
-            "  %-15s  %5d docs total, %4d val (%.1f%%)",
-            source, len(doc_keys), len(val_keys),
-            100.0 * len(val_keys) / len(doc_keys),
+            "  %-15s  %5d docs total, %s",
+            source, n_docs, ", ".join(log_parts),
         )
 
     # Partition entries
     train_entries = []
     val_entries = []
+    test_entries = []
     for idx, entry in enumerate(entries):
         key = (entry["source"], entry["id"])
         if key in val_doc_keys:
             val_entries.append(entry)
+        elif key in test_doc_keys:
+            test_entries.append(entry)
         else:
             train_entries.append(entry)
 
-    return train_entries, val_entries
+    return train_entries, val_entries, test_entries
 
 
 def _log_split_stats(entries: list, continuation_pairs: list, label: str):
@@ -395,9 +418,9 @@ def main():
     parser.add_argument(
         "--val_ratio",
         type=float,
-        default=0.02,
+        default=0.001,
         help="Fraction of documents per source to hold out for validation. "
-        "Set to 0.0 to disable val split. Default: 0.02 (2%%).",
+        "Set to 0.0 to disable val split. Default: 0.001 (0.1%%).",
     )
     parser.add_argument(
         "--val_output_path",
@@ -407,15 +430,33 @@ def main():
         "Default: {output_path stem}_val.json.",
     )
     parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of documents per source to hold out for testing. "
+        "Set to 0.0 to disable test split (default). E.g. 0.009 (0.9%%).",
+    )
+    parser.add_argument(
+        "--test_output_path",
+        type=str,
+        default=None,
+        help="Output path for the test index JSON file. "
+        "Default: {output_path stem}_test.json.",
+    )
+    parser.add_argument(
         "--split_seed",
         type=int,
         default=42,
-        help="Random seed for train/val document split. Default: 42.",
+        help="Random seed for document split. Default: 42.",
     )
     args = parser.parse_args()
 
     if args.val_ratio < 0 or args.val_ratio >= 1.0:
         parser.error("--val_ratio must be in [0.0, 1.0)")
+    if args.test_ratio < 0 or args.test_ratio >= 1.0:
+        parser.error("--test_ratio must be in [0.0, 1.0)")
+    if args.val_ratio + args.test_ratio >= 1.0:
+        parser.error("--val_ratio + --test_ratio must be < 1.0")
 
     if args.merge_max_tokens < args.merge_short_threshold:
         logger.warning(
@@ -424,10 +465,12 @@ def main():
             args.merge_max_tokens, args.merge_short_threshold,
         )
 
-    # Default val output path
+    # Default output paths
+    stem, ext = os.path.splitext(args.output_path)
     if args.val_output_path is None and args.val_ratio > 0:
-        stem, ext = os.path.splitext(args.output_path)
         args.val_output_path = f"{stem}_val{ext}"
+    if args.test_output_path is None and args.test_ratio > 0:
+        args.test_output_path = f"{stem}_test{ext}"
 
     # --- Step 1: Scan all JSONL files ---
     all_entries = []
@@ -452,22 +495,28 @@ def main():
 
     logger.info("Total entries after scan: %d", len(all_entries))
 
-    # --- Step 2: Train/val split (before upsample/merge) ---
-    if args.val_ratio > 0:
+    # --- Step 2: Train/val/test split (before upsample/merge) ---
+    if args.val_ratio > 0 or args.test_ratio > 0:
         logger.info(
-            "Splitting by document: val_ratio=%.2f, seed=%d",
-            args.val_ratio, args.split_seed,
+            "Splitting by document: val_ratio=%.4f, test_ratio=%.4f, seed=%d",
+            args.val_ratio, args.test_ratio, args.split_seed,
         )
-        train_entries, val_entries = split_by_document(
-            all_entries, args.val_ratio, args.split_seed,
+        train_entries, val_entries, test_entries = split_by_document(
+            all_entries,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.split_seed,
         )
         logger.info(
-            "Split result: %d train entries, %d val entries",
-            len(train_entries), len(val_entries),
+            "Split result: %d train, %d val, %d test entries",
+            len(train_entries), len(val_entries), len(test_entries),
         )
+        val_entries = val_entries if args.val_ratio > 0 else None
+        test_entries = test_entries if args.test_ratio > 0 else None
     else:
         train_entries = all_entries
         val_entries = None
+        test_entries = None
 
     # --- Step 3: Process train split ---
     logger.info("=== Processing train split ===")
@@ -506,6 +555,16 @@ def main():
 
         _log_split_stats(val_entries, val_pairs, "val")
         _write_index(val_entries, val_pairs, args.val_output_path, "val")
+
+    # --- Step 5: Process test split (no upsample, no merge) ---
+    if test_entries is not None:
+        logger.info("=== Processing test split ===")
+
+        test_pairs = build_continuation_pairs(test_entries)
+        logger.info("[test] Continuation pairs: %d", len(test_pairs))
+
+        _log_split_stats(test_entries, test_pairs, "test")
+        _write_index(test_entries, test_pairs, args.test_output_path, "test")
 
 
 if __name__ == "__main__":

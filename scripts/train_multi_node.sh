@@ -79,8 +79,8 @@ torchrun \
   --gradient_checkpointing True \
   --save_strategy steps \
   --save_steps 5000 \
-  --save_total_limit 5 \
-  --per_device_eval_batch_size 2 \
+  --save_total_limit 3 \
+  --per_device_eval_batch_size 4 \
   --eval_strategy steps \
   --eval_steps 500 \
   --prediction_loss_only True \
