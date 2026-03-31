@@ -86,13 +86,21 @@ class KawaiiInferenceEngine:
     def _patch_prepare_inputs(self):
         """Monkey-patch LLM's prepare_inputs_for_generation for inputs_embeds support.
 
-        Following the C3.py:249-307 pattern. Qwen3's native method may not handle
-        inputs_embeds correctly on the first generation step when no KV cache exists.
+        Following the C3.py:249-307 pattern. HF generate() pops inputs_embeds
+        from model_kwargs in _prepare_model_inputs(), so prepare_inputs_for_generation
+        never receives it. We stash it on the model object before calling generate()
+        and recover it here.
         """
         original = self.model.llm.prepare_inputs_for_generation
+        llm = self.model.llm
 
         def patched(input_ids, past_key_values=None, attention_mask=None,
                     inputs_embeds=None, **kwargs):
+            # Recover inputs_embeds stashed by generate() caller
+            if inputs_embeds is None and hasattr(llm, "_kawaii_inputs_embeds"):
+                inputs_embeds = llm._kawaii_inputs_embeds
+                del llm._kawaii_inputs_embeds
+
             # First step: use inputs_embeds if provided and no cache yet
             if inputs_embeds is not None and past_key_values is None:
                 position_ids = None
@@ -312,6 +320,10 @@ class KawaiiInferenceEngine:
         }
 
         def _generate_with_autocast(**kw):
+            # Stash inputs_embeds so our patched prepare_inputs_for_generation
+            # can recover it (HF generate() pops it from model_kwargs).
+            if "inputs_embeds" in kw:
+                self.model.llm._kawaii_inputs_embeds = kw["inputs_embeds"]
             with torch.autocast(self.device.type, dtype=torch.bfloat16):
                 return self.model.llm.generate(**kw)
 
