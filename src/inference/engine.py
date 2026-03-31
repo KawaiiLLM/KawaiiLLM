@@ -35,9 +35,15 @@ class KawaiiInferenceEngine:
         self.num_mem_tokens = num_mem_tokens
 
         # --- Tokenizer (same sequence as train.py:58-74) ---
+        # Trainer saves tokenizer to checkpoint root, not llm/ subdir
         llm_dir = os.path.join(checkpoint_dir, "llm")
+        tokenizer_dir = (
+            llm_dir
+            if os.path.isfile(os.path.join(llm_dir, "tokenizer_config.json"))
+            else checkpoint_dir
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(
-            llm_dir, trust_remote_code=True
+            tokenizer_dir, trust_remote_code=True
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
