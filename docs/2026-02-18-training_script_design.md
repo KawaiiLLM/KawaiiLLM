@@ -492,6 +492,111 @@ torchrun \
 
 ---
 
+## Step 11: Monitoring Metrics
+
+训练过程通过多个 TensorBoard callback 追踪关键指标，控制参数为 `--monitor_steps`（默认 10）。所有指标仅在 rank 0 记录。
+
+### 11.1 Per-component Gradient Norm (`GradNormCallback`)
+
+通过 gradient hooks（backward 阶段、DeepSpeed reduce-scatter 之前）采集，反映本地 pre-reduction 梯度。绝对值可能与 HF Trainer 全局 `grad_norm` 略有差异，但组件间相对比较是准确的。每个 optimizer step 重置累积值。
+
+**TensorBoard keys（每个 optimizer step 写入）:**
+
+| Key | 含义 |
+|:----|:-----|
+| `grad_norm/projector` | Projector + mem_embeddings 的梯度 L2 范数 |
+| `grad_norm/meme` | MemE (Qwen3-Embedding-4B) 的梯度 L2 范数 |
+| `grad_norm/llm` | LLM (Qwen3-8B-Base) 的梯度 L2 范数 |
+
+**解读要点:**
+- 绝对值受参数量影响：LLM (8B) > MemE (4B) >> Projector（两层 MLP），梯度范数大小顺序与参数量正相关。
+- 整体下降趋势表明训练在收敛，持续上升可能预示梯度爆炸。
+- 梯度为零说明对应组件被冻结或梯度断流。
+
+### 11.2 Gradient Energy Percentage (`GradNormCallback`)
+
+各组件梯度 L2 范数的**平方**占总平方和的百分比，三组件加和为 100%。反映哪个组件主导了参数更新方向。
+
+**TensorBoard keys（每个 optimizer step 写入）:**
+
+| Key | 含义 |
+|:----|:-----|
+| `grad_energy_pct/projector` | Projector 梯度能量占比 (%) |
+| `grad_energy_pct/meme` | MemE 梯度能量占比 (%) |
+| `grad_energy_pct/llm` | LLM 梯度能量占比 (%) |
+
+**解读要点:**
+- 训练初期 LLM 通常主导梯度能量（>90%），因为 MemE 输出尚未携带有效信息，LLM 仅靠自回归能力降低 loss。
+- 随着训练推进，MemE 可能出现**相变（phase transition）**：梯度能量从 <5% 突然跃升到 >50%，标志着压缩管道开始有效传递信息。这是 encoder-decoder 联合训练中的已知现象，不需要人为干预。
+- Projector 参数量极小，梯度能量占比通常 <2%，这是正常的——不代表 Projector 没在学习（per-parameter 梯度可能很大）。
+
+### 11.3 Per-task Loss (`TaskLossCallback`)
+
+每 `monitor_steps` 步统计窗口内各任务的 per-sample 平均 loss。Loss 在 `KawaiiLLMModel.forward()` 中顺路计算并累积到 `model._task_accum`，callback 读取后清零。
+
+**TensorBoard keys（每 monitor_steps 写入）:**
+
+| Key | 任务 | 含义 |
+|:----|:-----|:-----|
+| `task_loss/ntp` | Next Token Prediction | 标准自回归语言建模，无 MemE 参与 |
+| `task_loss/recon` | Reconstruction | 从 MemE 压缩表示重建原始文本 |
+| `task_loss/cont` | Continuation | 从前一个 chunk 的 MemE 压缩表示生成当前 chunk |
+
+**解读要点:**
+- 预期难度排序：`cont > ntp > recon`（在压缩管道训练成熟后）。Continuation 最难（跨 chunk 预测，信息瓶颈最大）；Reconstruction 理论上最简单（拥有目标文本的完整压缩表示，信息量多于 NTP 的自回归上下文）。
+- **Recon vs NTP 交叉是关键里程碑**：训练初期 recon > ntp（压缩管道未学通，memory tokens 信息量不如直接看原始 token），当 recon 降到 ntp 以下时，说明 MemE→Projector→LLM 管道开始有效工作。
+- Continuation 停滞但 recon 下降，说明 MemE 学会了自编码（chunk 内压缩-解压缩）但尚未学会跨 chunk 的预测性编码。
+- 波动幅度受 `monitor_steps` 影响：窗口越小，统计样本越少，方差越大。
+
+### 11.4 Task Gradient Contribution (`TaskLossCallback`)
+
+各任务对总梯度的贡献代理指标。计算方式：`contrib[task] = mean_loss[task] × n_samples[task]`，归一化到 100%。反映哪个任务主导了参数更新方向。
+
+**TensorBoard keys（每 monitor_steps 写入）:**
+
+| Key | 含义 |
+|:----|:-----|
+| `task_grad_contrib_pct/ntp` | NTP 任务梯度贡献占比 (%) |
+| `task_grad_contrib_pct/recon` | Reconstruction 任务梯度贡献占比 (%) |
+| `task_grad_contrib_pct/cont` | Continuation 任务梯度贡献占比 (%) |
+
+**解读要点:**
+- 由任务采样比例和各任务 loss 共同决定。
+- 如果某个任务贡献过低（如 cont <15%），其梯度信号可能被其他任务淹没，导致该任务进展缓慢。此时可考虑提高该任务的 loss 权重或调整数据采样比例。
+- 随着 recon loss 快速下降，其梯度贡献占比会自然减小，为其他任务腾出更多梯度空间。
+
+### 11.5 Per-component Learning Rate (`LRLogCallback`)
+
+各组件的实际学习率，在 `on_step_begin`（LLMFreezeCallback 调整之后）采集，反映 optimizer 实际使用的 LR。
+
+**TensorBoard keys（每个 optimizer step 写入）:**
+
+| Key | 含义 |
+|:----|:-----|
+| `lr/projector` | Projector + mem_embeddings 学习率 |
+| `lr/meme` | MemE 学习率 |
+| `lr/llm` | LLM 学习率（冻结期间为 0） |
+
+**解读要点:**
+- 验证 cosine scheduler 和 warmup 行为是否符合预期。
+- 当使用 `LLMFreezeCallback` 时，`lr/llm` 在冻结期间为 0，解冻后线性 ramp-up 再交由 scheduler 管理。
+
+### 11.6 Evaluation Metrics (`KawaiiTrainer.evaluate()`)
+
+每 `eval_steps` 步在验证集上计算，由 `KawaiiTrainer.evaluate()` 重写实现。
+
+| Key | 含义 | 计算方式 |
+|:----|:-----|:---------|
+| `eval_loss` | 验证集平均 cross-entropy loss | HF Trainer 内置 |
+| `eval_perplexity` | 验证集困惑度 | `exp(min(eval_loss, 100))`，上限 100 防止溢出 |
+
+**解读要点:**
+- Perplexity 是 loss 的指数变换，对 loss 变化更敏感：loss 从 2.0 降到 1.5 对应 PPL 从 7.39 降到 4.48。
+- 验证集使用文档级分层采样（`val_ratio=0.001`），确保各数据源按比例出现。
+- `--prediction_loss_only True` 防止 HF 累积全量 logits 导致 OOM（vocab=152064，单个 batch logits 在 float32 下可达数十 GB）。
+
+---
+
 ## Verification Plan
 
 1. **Smoke test:** 100-entry test JSONL, single GPU, 10 steps, `n_mem=1` — verify forward pass completes.
