@@ -75,55 +75,10 @@ class KawaiiInferenceEngine:
         self.model.to(self.device).eval()
         logger.info("Model loaded on %s", self.device)
 
-        # Monkey-patch prepare_inputs_for_generation for inputs_embeds support
-        self._patch_prepare_inputs()
-
         # Cached memory state
         self._memory_prefix_embeds: Optional[torch.Tensor] = None  # [1, n_mem+2, 4096]
         self._memory_prefix_mask: Optional[torch.Tensor] = None    # [1, n_mem+2]
         self._active_n_mem: int = 0
-
-    def _patch_prepare_inputs(self):
-        """Monkey-patch LLM's prepare_inputs_for_generation for inputs_embeds support.
-
-        Following the C3.py:249-307 pattern. HF generate() pops inputs_embeds
-        from model_kwargs in _prepare_model_inputs(), so prepare_inputs_for_generation
-        never receives it. We stash it on the model object before calling generate()
-        and recover it here.
-        """
-        original = self.model.llm.prepare_inputs_for_generation
-        llm = self.model.llm
-
-        def patched(input_ids, past_key_values=None, attention_mask=None,
-                    inputs_embeds=None, **kwargs):
-            # Recover inputs_embeds stashed by generate() caller
-            if inputs_embeds is None and hasattr(llm, "_kawaii_inputs_embeds"):
-                inputs_embeds = llm._kawaii_inputs_embeds
-                del llm._kawaii_inputs_embeds
-
-            # First step: use inputs_embeds if provided and no cache yet
-            if inputs_embeds is not None and past_key_values is None:
-                position_ids = None
-                if attention_mask is not None:
-                    position_ids = attention_mask.long().cumsum(-1) - 1
-                    position_ids.masked_fill_(attention_mask == 0, 1)
-                return {
-                    "inputs_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    "past_key_values": past_key_values,
-                    "use_cache": kwargs.get("use_cache", True),
-                }
-            # Subsequent steps: delegate to original (uses input_ids + KV cache)
-            return original(
-                input_ids,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                inputs_embeds=None,  # force None so original uses input_ids
-                **kwargs,
-            )
-
-        self.model.llm.prepare_inputs_for_generation = patched
 
     @torch.no_grad()
     def set_memory(self, memory_text: str, n_mem: Optional[int] = None) -> None:
@@ -273,6 +228,44 @@ class KawaiiInferenceEngine:
             conversation_ids = conversation_ids[-available:]
         return conversation_ids
 
+    def _sample_next_token(self, logits, generated_ids, temperature,
+                           top_p, top_k, repetition_penalty):
+        """Sample a single token from logits."""
+        scores = logits.clone()  # [1, vocab]
+
+        # Repetition penalty
+        if repetition_penalty != 1.0 and generated_ids:
+            for tid in set(generated_ids):
+                if scores[0, tid] < 0:
+                    scores[0, tid] *= repetition_penalty
+                else:
+                    scores[0, tid] /= repetition_penalty
+
+        # Temperature
+        if temperature > 0:
+            scores = scores / max(temperature, 1e-7)
+
+        # Top-k
+        if top_k > 0:
+            topk_vals = torch.topk(scores, min(top_k, scores.size(-1)))[0]
+            scores[scores < topk_vals[:, -1:]] = float("-inf")
+
+        # Top-p (nucleus)
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(scores, descending=True)
+            cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cum_probs > top_p
+            remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
+            indices_to_remove = sorted_idx[remove]
+            scores[0, indices_to_remove] = float("-inf")
+
+        # Sample or argmax
+        if temperature > 0:
+            probs = torch.softmax(scores, dim=-1)
+            return torch.multinomial(probs, num_samples=1)  # [1, 1]
+        return torch.argmax(scores, dim=-1, keepdim=True)   # [1, 1]
+
     @torch.no_grad()
     def generate(
         self,
@@ -286,17 +279,8 @@ class KawaiiInferenceEngine:
     ) -> Union[str, Iterator[str]]:
         """Generate a response given conversation messages.
 
-        Args:
-            messages: List of {"role": "user"|"assistant", "content": str}.
-            max_new_tokens: Maximum number of tokens to generate.
-            temperature: Sampling temperature (0 = greedy).
-            top_p: Nucleus sampling probability threshold.
-            top_k: Top-k sampling.
-            repetition_penalty: Repetition penalty (1.0 = no penalty).
-            stream: If True, returns an Iterator yielding token strings.
-
-        Returns:
-            Generated text string, or an Iterator[str] if stream=True.
+        Uses manual prefill + autoregressive loop instead of HF generate()
+        to avoid inputs_embeds compatibility issues across transformers versions.
         """
         conversation_text = self._format_conversation(messages)
         conversation_ids = self.tokenizer.encode(
@@ -306,50 +290,73 @@ class KawaiiInferenceEngine:
         conversation_ids = self._truncate_conversation(conversation_ids, max_len=max_ctx)
 
         llm_inputs = self._build_llm_inputs(conversation_ids)
+        inputs_embeds = llm_inputs["inputs_embeds"]
+        attention_mask = llm_inputs["attention_mask"]
+        position_ids = llm_inputs["position_ids"]
+        eos_id = self.tokenizer.eos_token_id
 
-        gen_kwargs = {
-            **llm_inputs,
-            "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-            "temperature": max(temperature, 1e-7),
-            "top_p": top_p,
-            "top_k": top_k,
-            "repetition_penalty": repetition_penalty,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "pad_token_id": self.tokenizer.pad_token_id,
-        }
+        # Phase 1: Prefill — single forward pass to build KV cache
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
+            prefill = self.model.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=True,
+                return_dict=True,
+            )
+        past_kv = prefill.past_key_values
+        logits = prefill.logits[:, -1:, :]  # [1, 1, vocab]
 
-        def _generate_with_autocast(**kw):
-            # Stash inputs_embeds so our patched prepare_inputs_for_generation
-            # can recover it (HF generate() pops it from model_kwargs).
-            if "inputs_embeds" in kw:
-                self.model.llm._kawaii_inputs_embeds = kw["inputs_embeds"]
-            with torch.autocast(self.device.type, dtype=torch.bfloat16):
-                return self.model.llm.generate(**kw)
+        # Phase 2: Autoregressive decoding
+        def _decode_loop(streamer=None):
+            nonlocal past_kv, logits, attention_mask
+            generated_ids = []
+            try:
+                for _ in range(max_new_tokens):
+                    next_token = self._sample_next_token(
+                        logits.squeeze(1), generated_ids,
+                        temperature, top_p, top_k, repetition_penalty,
+                    )  # [1, 1]
+
+                    tid = next_token.item()
+                    if tid == eos_id:
+                        break
+                    generated_ids.append(tid)
+
+                    if streamer is not None:
+                        streamer.put(next_token)
+
+                    # Extend attention mask
+                    attention_mask = torch.cat([
+                        attention_mask,
+                        torch.ones(1, 1, dtype=attention_mask.dtype,
+                                   device=self.device),
+                    ], dim=1)
+                    new_pos = (attention_mask.sum(dim=-1, keepdim=True) - 1)
+
+                    with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                        out = self.model.llm(
+                            input_ids=next_token,
+                            attention_mask=attention_mask,
+                            position_ids=new_pos,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                            return_dict=True,
+                        )
+                    past_kv = out.past_key_values
+                    logits = out.logits  # [1, 1, vocab]
+            finally:
+                if streamer is not None:
+                    streamer.end()
+            return generated_ids
 
         if stream:
             streamer = TextIteratorStreamer(
                 self.tokenizer, skip_prompt=True, skip_special_tokens=True
             )
-            gen_kwargs["streamer"] = streamer
-
-            # C2 fix: wrap streaming generation in autocast via helper
-            thread = Thread(
-                target=_generate_with_autocast, kwargs=gen_kwargs, daemon=True
-            )
+            thread = Thread(target=_decode_loop, args=(streamer,), daemon=True)
             thread.start()
-            return streamer  # caller iterates: for token in streamer: ...
+            return streamer
         else:
-            output_ids = _generate_with_autocast(**gen_kwargs)
-            # W3 fix: skip_prompt=True in TextIteratorStreamer handles stripping
-            # for the streaming path. For non-streaming, HF generate() returns
-            # the full sequence including a dummy input_ids when inputs_embeds
-            # is used. Use the prompt length to strip correctly.
-            prompt_len = llm_inputs["inputs_embeds"].shape[1]
-            # HF may return output starting from prompt or from generated tokens
-            # depending on version. Handle both cases:
-            if output_ids.shape[1] > prompt_len:
-                generated = output_ids[0, prompt_len:]
-            else:
-                generated = output_ids[0]
-            return self.tokenizer.decode(generated, skip_special_tokens=True)
+            generated_ids = _decode_loop()
+            return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
