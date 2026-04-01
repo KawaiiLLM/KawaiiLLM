@@ -377,7 +377,7 @@ class KawaiiInferenceEngine:
 
         if stream:
             streamer = TextIteratorStreamer(
-                self.tokenizer, skip_prompt=True, skip_special_tokens=True
+                self.tokenizer, skip_prompt=False, skip_special_tokens=True
             )
             thread = Thread(target=_decode_loop, args=(streamer,), daemon=True)
             thread.start()
