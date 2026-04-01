@@ -42,6 +42,12 @@ export async function* streamChat(messages, params = {}) {
   }
 }
 
+export async function stopGeneration() {
+  const res = await fetch(`${API_BASE}/api/stop`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Stop API error: ${res.status}`)
+  return res.json()
+}
+
 export async function healthCheck() {
   const res = await fetch(`${API_BASE}/api/health`)
   return res.json()

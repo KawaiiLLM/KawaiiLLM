@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .engine import KawaiiInferenceEngine
 
@@ -55,7 +55,7 @@ async def health():
 @app.post("/api/memory")
 async def set_memory(request: Request):
     if engine is None:
-        return {"error": "Model not loaded"}, 503
+        return JSONResponse({"error": "Model not loaded"}, status_code=503)
     body = await request.json()
     memory_text = body.get("memory_text", "")
     n_mem = body.get("n_mem", None)
@@ -63,15 +63,24 @@ async def set_memory(request: Request):
     return {"status": "ok", "n_mem": engine._active_n_mem}
 
 
+@app.post("/api/stop")
+async def stop_generation():
+    if engine is None:
+        return JSONResponse({"error": "Model not loaded"}, status_code=503)
+    engine.stop()
+    return {"status": "ok"}
+
+
 @app.post("/api/chat")
 async def chat(request: Request):
     if engine is None:
-        return {"error": "Model not loaded"}, 503
+        return JSONResponse({"error": "Model not loaded"}, status_code=503)
     body = await request.json()
     messages = body.get("messages", [])
     if not messages:
-        return {"error": "Empty messages"}, 400
+        return JSONResponse({"error": "Empty messages"}, status_code=400)
     params = body.get("params", {})
+    template = params.pop("template", "simple")
 
     async def event_stream():
         loop = asyncio.get_event_loop()
@@ -79,7 +88,7 @@ async def chat(request: Request):
         # The actual generation runs in a daemon thread inside generate().
         streamer = await loop.run_in_executor(
             None,
-            lambda: engine.generate(messages, stream=True, **params),
+            lambda: engine.generate(messages, stream=True, template=template, **params),
         )
         # C3 fix: TextIteratorStreamer.__next__ blocks (queue.get), so we must
         # call it in a thread executor to avoid blocking the asyncio event loop.

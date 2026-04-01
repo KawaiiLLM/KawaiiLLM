@@ -35,6 +35,10 @@ export default function Sidebar({ open, onToggle, genParams, onParamsChange, onN
         <div className="flex-1 overflow-y-auto px-3">
           <div className="text-[12px] text-text-300 mb-3">Generation</div>
 
+          <TemplateSelect
+            value={genParams.template}
+            onChange={(v) => onParamsChange({ ...genParams, template: v })}
+          />
           <ParamSlider
             label="Temperature" value={genParams.temperature}
             min={0} max={2} step={0.05}
@@ -57,6 +61,31 @@ export default function Sidebar({ open, onToggle, genParams, onParamsChange, onN
           />
         </div>
       )}
+    </div>
+  )
+}
+
+const TEMPLATES = [
+  { value: 'none', label: 'None (raw text)' },
+  { value: 'simple', label: 'Simple (User/Assistant)' },
+  { value: 'chatml', label: 'ChatML' },
+]
+
+function TemplateSelect({ value, onChange }) {
+  return (
+    <div className="mb-4">
+      <div className="text-[13px] text-text-200 mb-1">Chat Template</div>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-2 py-1.5 text-[13px] rounded-[6px] border border-border-100
+                   bg-bg-100 text-text-100 cursor-pointer outline-none
+                   focus:border-accent"
+      >
+        {TEMPLATES.map((t) => (
+          <option key={t.value} value={t.value}>{t.label}</option>
+        ))}
+      </select>
     </div>
   )
 }

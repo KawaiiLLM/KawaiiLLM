@@ -3,25 +3,28 @@ import Sidebar from './components/Sidebar'
 import MemoryPanel from './components/MemoryPanel'
 import ChatInput from './components/ChatInput'
 import MessageBubble from './components/MessageBubble'
-import { setMemory as setMemoryApi, streamChat } from './api'
+import { setMemory as setMemoryApi, streamChat, stopGeneration } from './api'
 
 const DEFAULT_PARAMS = {
   temperature: 0.7,
   top_p: 0.9,
   max_new_tokens: 2048,
   repetition_penalty: 1.0,
+  template: 'simple',
 }
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [messages, setMessages] = useState([])
   const [memoryText, setMemoryText] = useState('')
+  const [nMem, setNMem] = useState(128)
   const [appliedMemory, setAppliedMemory] = useState('')
+  const [appliedNMem, setAppliedNMem] = useState(128)
   const [isStreaming, setIsStreaming] = useState(false)
   const [genParams, setGenParams] = useState(DEFAULT_PARAMS)
   const scrollRef = useRef(null)
 
-  const memoryDirty = memoryText !== appliedMemory
+  const memoryDirty = memoryText !== appliedMemory || nMem !== appliedNMem
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -31,8 +34,9 @@ export default function App() {
 
   async function handleApplyMemory() {
     if (!memoryDirty) return
-    await setMemoryApi(memoryText)
+    await setMemoryApi(memoryText, nMem)
     setAppliedMemory(memoryText)
+    setAppliedNMem(nMem)
   }
 
   async function handleSend(userMessage) {
@@ -40,8 +44,9 @@ export default function App() {
 
     // Apply memory if dirty
     if (memoryDirty && memoryText.trim()) {
-      await setMemoryApi(memoryText)
+      await setMemoryApi(memoryText, nMem)
       setAppliedMemory(memoryText)
+      setAppliedNMem(nMem)
     }
 
     const newMessages = [...messages, { role: 'user', content: userMessage }]
@@ -73,6 +78,10 @@ export default function App() {
     } finally {
       setIsStreaming(false)
     }
+  }
+
+  async function handleStop() {
+    try { await stopGeneration() } catch (e) { console.error('Stop error:', e) }
   }
 
   function handleNewChat() {
@@ -116,11 +125,14 @@ export default function App() {
             <MemoryPanel
               memoryText={memoryText}
               onMemoryChange={setMemoryText}
+              nMem={nMem}
+              onNMemChange={setNMem}
               onApply={handleApplyMemory}
               dirty={memoryDirty}
             />
             <ChatInput
               onSend={handleSend}
+              onStop={handleStop}
               disabled={isStreaming}
               placeholder={messages.length === 0 ? 'Start a conversation...' : 'Reply...'}
             />

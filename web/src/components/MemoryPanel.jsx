@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ChevronIcon, MemoryIcon } from '../icons'
 
-export default function MemoryPanel({ memoryText, onMemoryChange, onApply, dirty }) {
+export default function MemoryPanel({ memoryText, onMemoryChange, nMem, onNMemChange, onApply, dirty }) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -33,6 +33,20 @@ export default function MemoryPanel({ memoryText, onMemoryChange, onApply, dirty
                          px-3 py-2.5 text-[14px] leading-[1.5] placeholder:text-text-300
                          focus:outline-none border border-border-100"
             />
+            <div className="mt-2">
+              <div className="flex justify-between text-[13px] mb-1">
+                <span className="text-text-200">Latent Tokens</span>
+                <span className="text-text-300">{nMem}</span>
+              </div>
+              <input
+                type="range" min={8} max={128} step={8} value={nMem}
+                onChange={(e) => onNMemChange(parseInt(e.target.value))}
+                className="w-full h-1 bg-bg-300 rounded-full appearance-none cursor-pointer
+                           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3
+                           [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full
+                           [&::-webkit-slider-thumb]:bg-accent"
+              />
+            </div>
             <div className="flex justify-end mt-2">
               <button
                 onClick={onApply}

@@ -10,7 +10,7 @@ and forward() non-NTP path (lines 488-589) exactly for B=1 inference.
 
 import logging
 import os
-from threading import Thread
+from threading import Event, Thread
 from typing import Iterator, Optional, Union
 
 import torch
@@ -79,6 +79,11 @@ class KawaiiInferenceEngine:
         self._memory_prefix_embeds: Optional[torch.Tensor] = None  # [1, n_mem+2, 4096]
         self._memory_prefix_mask: Optional[torch.Tensor] = None    # [1, n_mem+2]
         self._active_n_mem: int = 0
+        self._stop_event = Event()
+
+    def stop(self):
+        """Signal the current generation to stop."""
+        self._stop_event.set()
 
     @torch.no_grad()
     def set_memory(self, memory_text: str, n_mem: Optional[int] = None) -> None:
@@ -94,7 +99,7 @@ class KawaiiInferenceEngine:
             logger.info("Memory cleared")
             return
 
-        n_mem = n_mem or self.num_mem_tokens
+        n_mem = min(n_mem, self.num_mem_tokens) if n_mem is not None else self.num_mem_tokens
         self._active_n_mem = n_mem
 
         # Tokenize context (no left-padding needed for B=1)
@@ -203,11 +208,28 @@ class KawaiiInferenceEngine:
             "position_ids": position_ids,
         }
 
-    def _format_conversation(self, messages: list) -> str:
+    def _format_conversation(self, messages: list, template: str = "simple") -> str:
         """Format multi-turn messages into a single string for tokenization.
 
-        Qwen3-8B-Base is a base model (no chat template), so we use a simple format.
+        Templates:
+          - "none":   Raw concatenation, no role markers (matches pretraining).
+          - "simple": ``User: ... \\n Assistant: ...`` (default).
+          - "chatml": ``<|im_start|>role\\n...<|im_end|>`` (ChatML format).
         """
+        if template == "none":
+            parts = [msg["content"] for msg in messages]
+            return "\n".join(parts) + "\n"
+
+        if template == "chatml":
+            parts = []
+            for msg in messages:
+                parts.append(
+                    f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>"
+                )
+            parts.append("<|im_start|>assistant\n")
+            return "\n".join(parts)
+
+        # default: "simple"
         parts = []
         for msg in messages:
             role = msg["role"]
@@ -216,7 +238,6 @@ class KawaiiInferenceEngine:
                 parts.append(f"User: {content}")
             elif role == "assistant":
                 parts.append(f"Assistant: {content}")
-        # Append prompt for assistant response
         parts.append("Assistant:")
         return "\n".join(parts)
 
@@ -276,13 +297,15 @@ class KawaiiInferenceEngine:
         top_k: int = 50,
         repetition_penalty: float = 1.0,
         stream: bool = False,
+        template: str = "simple",
     ) -> Union[str, Iterator[str]]:
         """Generate a response given conversation messages.
 
         Uses manual prefill + autoregressive loop instead of HF generate()
         to avoid inputs_embeds compatibility issues across transformers versions.
         """
-        conversation_text = self._format_conversation(messages)
+        self._stop_event.clear()
+        conversation_text = self._format_conversation(messages, template=template)
         conversation_ids = self.tokenizer.encode(
             conversation_text, add_special_tokens=False
         )
@@ -313,6 +336,8 @@ class KawaiiInferenceEngine:
             generated_ids = []
             try:
                 for _ in range(max_new_tokens):
+                    if self._stop_event.is_set():
+                        break
                     next_token = self._sample_next_token(
                         logits.squeeze(1), generated_ids,
                         temperature, top_p, top_k, repetition_penalty,

@@ -1,7 +1,7 @@
 import { useState, useRef } from 'react'
-import { SendIcon } from '../icons'
+import { SendIcon, StopIcon } from '../icons'
 
-export default function ChatInput({ onSend, disabled, placeholder = 'Send a message...' }) {
+export default function ChatInput({ onSend, onStop, disabled, placeholder = 'Send a message...' }) {
   const [value, setValue] = useState('')
   const textareaRef = useRef(null)
 
@@ -45,16 +45,26 @@ export default function ChatInput({ onSend, disabled, placeholder = 'Send a mess
           style={{ maxHeight: '200px' }}
         />
         <div className="flex justify-end">
-          <button
-            onClick={handleSubmit}
-            disabled={!hasText || disabled}
-            className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors
-              ${hasText && !disabled
-                ? 'bg-accent text-white hover:bg-accent-hover cursor-pointer'
-                : 'bg-bg-300 text-text-300 cursor-not-allowed'}`}
-          >
-            <SendIcon />
-          </button>
+          {disabled ? (
+            <button
+              onClick={onStop}
+              className="w-8 h-8 rounded-full flex items-center justify-center
+                         bg-accent text-white hover:bg-accent-hover cursor-pointer transition-colors"
+            >
+              <StopIcon />
+            </button>
+          ) : (
+            <button
+              onClick={handleSubmit}
+              disabled={!hasText}
+              className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors
+                ${hasText
+                  ? 'bg-accent text-white hover:bg-accent-hover cursor-pointer'
+                  : 'bg-bg-300 text-text-300 cursor-not-allowed'}`}
+            >
+              <SendIcon />
+            </button>
+          )}
         </div>
       </div>
     </div>
